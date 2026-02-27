@@ -48,9 +48,21 @@ internal static class InternalTiming
 #if USLP_WINDOWS || USLP_GENERATOR
         if (!_isWin) return IntPtr.Zero;
         if (_tTimer != IntPtr.Zero) return _tTimer;
-        _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+
+        try
+        {
+            _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (_tTimer == IntPtr.Zero)
+                _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, 0, TIMER_ALL_ACCESS);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _tTimer = IntPtr.Zero;
+        }
+
         if (_tTimer == IntPtr.Zero)
-            _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, 0, TIMER_ALL_ACCESS);
+            _tTimer = CreateWaitableTimer(IntPtr.Zero, false, null);
+
         return _tTimer;
 #else
         return IntPtr.Zero;

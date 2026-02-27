@@ -32,9 +32,13 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool QueryPerformanceFrequency(out LARGE_INTEGER lpFrequency);
 
-    [LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateWaitableTimerExW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     internal static partial IntPtr CreateWaitableTimerEx(
         IntPtr lpTimerAttributes, string? lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateWaitableTimerW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    internal static partial IntPtr CreateWaitableTimer(
+        IntPtr lpTimerAttributes, [MarshalAs(UnmanagedType.Bool)] bool bManualReset, string? lpTimerName);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -91,9 +95,13 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool QueryPerformanceFrequency(out LARGE_INTEGER lpFrequency);
 
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [DllImport("kernel32.dll", EntryPoint = "CreateWaitableTimerExW", SetLastError = true, CharSet = CharSet.Unicode)]
     internal static extern IntPtr CreateWaitableTimerEx(
         IntPtr lpTimerAttributes, string? lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateWaitableTimerW", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern IntPtr CreateWaitableTimer(
+        IntPtr lpTimerAttributes, bool bManualReset, string? lpTimerName);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     internal static extern bool SetWaitableTimer(
