@@ -1,5 +1,7 @@
 # usleep_win_cs
 
+[English README](document/README_en.md)
+
 高精度・低ジッタな Windows 向け `usleep` 相当機能を **pure C#** で提供するライブラリです。
 
 `usleep_win_cs` は、Windows 上で **実用的な精度と低負荷** の短時間待機を実現するために、
@@ -165,11 +167,17 @@ if (UsleepWin.InitTimerResolution(1))
 ## 📁 ディレクトリ概要
 
 ```
-src/                   // 共有ソース
-pack/                  // NuGet 向け csproj
-unity/                 // Unity 向け csproj
+src/                   // ライブラリ本体ソース（Interop/Intrinsics 含む）
+pack/                  // NuGet パッケージ用 csproj
+unity/                 // Unity DLL 用 csproj
 samples/ConsoleDemo/   // C# コンソール使用例
 samples/UnityDemo/     // Unity 利用メモ
+document/              // ドキュメント（英語版 README など）
+
+build_all.bat          // 全ターゲットビルド
+build_net10.bat        // NuGet（net10.0-windows）ビルド
+build_unity_generic.bat// Unity Generic DLL ビルド
+build_unity_windows.bat// Unity Windows-only DLL ビルド
 ```
 
 ---
