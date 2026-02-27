@@ -12,6 +12,7 @@
     <Description>High-accuracy, low-jitter microsecond sleep for Windows (WaitableTimer + QPC + Yield). .NET 10+ (Windows).</Description>
     <PackageTags>usleep;windows;timer;qpc;yield;low-jitter;realtime</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/sdkikgeneral-spec/usleep_win_cs</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
