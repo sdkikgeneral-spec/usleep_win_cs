@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <AssemblyName>usleep_win_cs</AssemblyName>
+    <RootNamespace>Usleep.Win</RootNamespace>
+
+    <PackageId>usleep_win_cs</PackageId>
+    <Title>usleep_win_cs</Title>
+    <Version>0.1.0</Version>
+    <Authors>usleep_win_cs contributors</Authors>
+    <Company>usleep_win_cs contributors</Company>
+    <Description>High-accuracy, low-jitter microsecond sleep for Windows (WaitableTimer + QPC + Yield). .NET 10+ (Windows).</Description>
+    <PackageTags>usleep;windows;timer;qpc;yield;low-jitter;realtime</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <IsPackable>true</IsPackable>
+    <SupportedOSPlatform>Windows</SupportedOSPlatform>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <DefineConstants>$(DefineConstants);USLP_WINDOWS;USLP_NUGET;USLP_GENERATOR</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\src\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\LICENSE"  Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
