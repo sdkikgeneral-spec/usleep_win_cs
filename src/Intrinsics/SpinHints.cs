@@ -14,10 +14,16 @@ internal static class SpinHints
     internal static void HintOnce()
     {
 #if USLP_GENERATOR
+#if USLP_X64_ONLY
+        X86Base.Pause();
+#else
         if (X86Base.IsSupported) { X86Base.Pause(); return; }
         if (ArmBase.IsSupported) { ArmBase.Yield(); return; }
-#endif
         System.Threading.SpinWait sw = default; sw.SpinOnce();
+#endif
+#else
+        System.Threading.SpinWait sw = default; sw.SpinOnce();
+#endif
     }
 
 #if USLP_GENERATOR
@@ -27,6 +33,32 @@ internal static class SpinHints
 #endif
     internal static void HintFewTimes(int n = 3)
     {
-        for (int i = 0; i < n; i++) HintOnce();
+#if USLP_GENERATOR
+#if USLP_X64_ONLY
+        for (int i = 0; i < n; i++) X86Base.Pause();
+#else
+        if (X86Base.IsSupported)
+        {
+            for (int i = 0; i < n; i++) X86Base.Pause();
+            return;
+        }
+        if (ArmBase.IsSupported)
+        {
+            for (int i = 0; i < n; i++) ArmBase.Yield();
+            return;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            System.Threading.SpinWait sw = default;
+            sw.SpinOnce();
+        }
+#endif
+#else
+        for (int i = 0; i < n; i++)
+        {
+            System.Threading.SpinWait sw = default;
+            sw.SpinOnce();
+        }
+#endif
     }
 }

@@ -26,6 +26,10 @@
     <DefineConstants>$(DefineConstants);USLP_WINDOWS;USLP_NUGET;USLP_GENERATOR</DefineConstants>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(UslpX64Only)' == 'true'">
+    <DefineConstants>$(DefineConstants);USLP_X64_ONLY</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Include="..\src\**\*.cs" />
   </ItemGroup>
