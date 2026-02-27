@@ -12,6 +12,8 @@ namespace Usleep.Win
         [ThreadStatic] private static UsleepProfile _profile = UsleepProfile.BALANCED;
         [ThreadStatic] private static uint _tailSpinUs = 250;
         [ThreadStatic] private static UsleepYieldPolicy _yieldPolicy = UsleepYieldPolicy.SLEEP0;
+        private static readonly object _timerResolutionLock = new();
+        private static uint _timerResolutionMs;
 
 #if USLP_GENERATOR
     /// <summary>
@@ -137,7 +139,25 @@ namespace Usleep.Win
         public static bool InitTimerResolution(uint ms)
         {
 #if USLP_WINDOWS || USLP_GENERATOR
-            if (!Platform.IsWindows) return false; if (ms == 0) return false; return timeBeginPeriod(ms) == 0;
+            if (!Platform.IsWindows) return false;
+            if (ms == 0) return false;
+            lock (_timerResolutionLock)
+            {
+                if (_timerResolutionMs == ms) return true;
+
+                if (_timerResolutionMs != 0)
+                {
+                    timeEndPeriod(_timerResolutionMs);
+                    _timerResolutionMs = 0;
+                }
+
+                if (timeBeginPeriod(ms) == 0)
+                {
+                    _timerResolutionMs = ms;
+                    return true;
+                }
+                return false;
+            }
 #else
             return false;
 #endif
@@ -149,7 +169,15 @@ namespace Usleep.Win
         public static void ShutdownTimerResolution()
         {
 #if USLP_WINDOWS || USLP_GENERATOR
-            if (Platform.IsWindows) timeEndPeriod(1);
+            if (!Platform.IsWindows) return;
+            lock (_timerResolutionLock)
+            {
+                if (_timerResolutionMs != 0)
+                {
+                    timeEndPeriod(_timerResolutionMs);
+                    _timerResolutionMs = 0;
+                }
+            }
 #endif
         }
 

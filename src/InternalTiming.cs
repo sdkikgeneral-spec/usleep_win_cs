@@ -12,6 +12,7 @@ internal static class InternalTiming
 
 #if USLP_WINDOWS || USLP_GENERATOR
     [ThreadStatic] private static IntPtr _tTimer;
+    private static int _createWaitableTimerExState;
 #endif
 
     // Stats (thread-local)
@@ -49,15 +50,22 @@ internal static class InternalTiming
         if (!_isWin) return IntPtr.Zero;
         if (_tTimer != IntPtr.Zero) return _tTimer;
 
-        try
+        var exState = System.Threading.Volatile.Read(ref _createWaitableTimerExState);
+        if (exState >= 0)
         {
-            _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            if (_tTimer == IntPtr.Zero)
-                _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, 0, TIMER_ALL_ACCESS);
-        }
-        catch (EntryPointNotFoundException)
-        {
-            _tTimer = IntPtr.Zero;
+            try
+            {
+                _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                if (_tTimer == IntPtr.Zero)
+                    _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, 0, TIMER_ALL_ACCESS);
+                if (_tTimer != IntPtr.Zero && exState == 0)
+                    System.Threading.Volatile.Write(ref _createWaitableTimerExState, 1);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                System.Threading.Volatile.Write(ref _createWaitableTimerExState, -1);
+                _tTimer = IntPtr.Zero;
+            }
         }
 
         if (_tTimer == IntPtr.Zero)
