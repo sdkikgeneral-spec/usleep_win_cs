@@ -2,6 +2,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using System.Security;
 
 internal static partial class NativeMethods
 {
@@ -87,10 +88,12 @@ internal static partial class NativeMethods
     // ==============================
     // Unity (Windows flavor): DllImport
     // ==============================
+    [SuppressUnmanagedCodeSecurity]
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool QueryPerformanceCounter(out LARGE_INTEGER lpPerformanceCount);
 
+    [SuppressUnmanagedCodeSecurity]
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool QueryPerformanceFrequency(out LARGE_INTEGER lpFrequency);
@@ -114,9 +117,11 @@ internal static partial class NativeMethods
     [DllImport("kernel32.dll")]
     internal static extern bool CloseHandle(IntPtr hObject);
 
+    [SuppressUnmanagedCodeSecurity]
     [DllImport("kernel32.dll")]
     internal static extern void Sleep(uint dwMilliseconds);
 
+    [SuppressUnmanagedCodeSecurity]
     [DllImport("kernel32.dll")]
     internal static extern bool SwitchToThread();
 
