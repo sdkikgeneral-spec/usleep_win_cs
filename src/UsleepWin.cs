@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 using System;
 using static InternalTiming;
 using static NativeMethods;

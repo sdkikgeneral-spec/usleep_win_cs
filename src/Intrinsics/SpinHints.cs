@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 using System.Runtime.CompilerServices;
 #if USLP_GENERATOR
 using System.Runtime.Intrinsics.X86;

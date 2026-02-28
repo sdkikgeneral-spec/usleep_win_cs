@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 namespace Usleep.Win
 {
     /// <summary>
