@@ -14,7 +14,7 @@ namespace Usleep.Win
         [ThreadStatic] private static UsleepProfile _profile = UsleepProfile.BALANCED;
         [ThreadStatic] private static uint _tailSpinUs = 250;
         [ThreadStatic] private static UsleepYieldPolicy _yieldPolicy = UsleepYieldPolicy.SLEEP0;
-        private static readonly object _timerResolutionLock = new();
+        private static readonly object _timerResolutionLock = new object();
         private static uint _timerResolutionMs;
 
 #if USLP_GENERATOR
