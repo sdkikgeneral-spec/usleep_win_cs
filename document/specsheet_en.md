@@ -22,6 +22,7 @@
 11. [Statistics Counters](#11-statistics-counters)
 12. [Differences in Unity Builds](#12-differences-in-unity-builds)
 13. [Security and Safety](#13-security-and-safety)
+14. [PreciseDelay: High-Precision Async Timer](#14-precisedelay-high-precision-async-timer)
 
 ---
 
@@ -52,6 +53,7 @@ Compile-time constants select the implementation appropriate for each target env
 | `USLP_WINDOWS` | Unity Windows-only DLL | Uses `DllImport` + `SuppressUnmanagedCodeSecurity` |
 | `USLP_X64_ONLY` | NuGet x64-only build (optional) | Calls `X86Base.Pause()` directly without runtime branching |
 | `USLP_NUGET` | NuGet build identifier | Currently used alongside `USLP_GENERATOR`; reserved for future conditional use |
+| `USLP_UNITY` | Unity DLL (both variants) | Excludes the 5 `PreciseDelay`-related files from compilation (`#if !USLP_UNITY`) |
 
 **Generic build (neither constant defined):**  
 All Win32 API calls are excluded at compile time. `Platform.IsWindows` always returns `false`, so WaitableTimer, QPC, and Sleep APIs are never called. The implementation falls back to `Thread.Yield()` / `Thread.Sleep()` / `Stopwatch`.
@@ -415,6 +417,98 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 - **No cross-thread handle sharing**: `[ThreadStatic]` ensures each thread owns its timer handle exclusively.
 - **Timer resolution double-call prevention**: `_timerResolutionLock` serializes `timeBeginPeriod` calls, preventing race conditions.
 - **Integer overflow in `NowUs()`**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice.
+
+---
+
+---
+
+## 14. PreciseDelay: High-Precision Async Timer
+
+### 14.1 Overview
+
+`PreciseDelay` is a static class that provides **±1–3 µs** precision async waits — beyond what `UsleepWin` can achieve.
+A dedicated spin thread, timer wheel, and `IValueTaskSource` pool combine to deliver **zero-allocation** high-precision scheduling.
+
+NuGet target (`net10.0-windows`) only. All five source files are excluded from Unity DLL builds via `#if !USLP_UNITY`.
+
+### 14.2 Class Overview
+
+| Class / File | Role |
+| --- | --- |
+| `NativeClock` (`src/NativeClock.cs`) | ~1 ns timestamp by direct read of `KUSER_SHARED_DATA` (address `0x7FFE0000`). Zero P/Invoke hot path. Falls back to `Stopwatch.GetTimestamp()` if the value is unreliable or OS < Win10 1803. |
+| `PreciseWaitItem` (`src/PreciseWaitItem.cs`) | Wait item using `IValueTaskSource` + `ObjectPool<T>`. Issues zero-allocation `ValueTask` via `ManualResetValueTaskSourceCore<bool>`. |
+| `TimerWheel` (`src/TimerWheel.cs`) | 4096-slot timer wheel. O(1) slot calculation via `Math.BigMul` magic-number division. |
+| `SpinCoreEngine` (`src/SpinCoreEngine.cs`) | Spin thread pinned to a dedicated CPU core. Minimizes system timer resolution with `NtSetTimerResolution(1)` and calls `TimerWheel.Advance()` in a tight loop. |
+| `PreciseDelay` (`src/PreciseDelay.cs`) | Public API. Automatically routes to the spin path (≤5 ms) or WaitableTimer HR path (>5 ms). |
+
+### 14.3 NativeClock Implementation
+
+Reads offset `0x320` (`InterruptTime`) of the `KUSER_SHARED_DATA` structure directly via an `unsafe` pointer.
+Because a 64-bit value spans two 32-bit reads, it uses a tearing-read pattern — High → Low → High — retrying until the two High reads agree.
+
+```text
+address = (byte*)0x7FFE0000 + 0x320
+loop:
+    hi1 = *(uint*)(address + 4)
+    lo  = *(uint*)(address)
+    hi2 = *(uint*)(address + 4)
+    if hi1 == hi2: return (long)((ulong)hi1 << 32 | lo)
+```
+
+The value is in 100-ns units. It is scaled by a `Stopwatch.Frequency`-based coefficient to match the units of `Stopwatch.GetTimestamp()`.
+
+### 14.4 TimerWheel Design
+
+#### Slot Calculation (O(1) Magic-Number Division)
+
+`ticksPerSlot = Stopwatch.Frequency / 1_000_000` (ticks per µs) is computed at construction time. `ComputeMagicNumbers()` derives the corresponding magic multiplier.
+
+```text
+slot = (diff × magicMultiplier) >> (magicShift - 64)  [upper 64 bits]
+     & SlotMask
+```
+
+`diff = timestamp - _baseTimestamp` (`_baseTimestamp` is fixed at construction).
+At a QPC frequency of ~10 MHz, overflow requires **~29,000 years** — not a practical concern.
+
+#### Why `ResetBase()` Was Removed
+
+An early version of the spec included a `ResetBase()` method that reset `_baseTimestamp`. This caused a bug: already-queued items had slot indices computed against the old base, so after a reset they could fire up to ~4 ms late. Making `_baseTimestamp` `readonly` and setting it only once at construction eliminates the problem at its root.
+
+### 14.5 WaitAsync Routing
+
+```text
+delay ≤ 0          → complete immediately (equivalent to ValueTask.CompletedTask)
+0 < delay ≤ 5 ms   → enqueue into SpinCoreEngine (spin path)
+delay > 5 ms       → WaitableTimerAsync (WaitableTimer HR path)
+```
+
+On the spin path, `PreciseWaitItemPool.Rent()` obtains a wait item and `TimerWheel.Enqueue()` registers it with a deadline. The SpinCoreEngine spin loop calls `TimerWheel.Advance()` to drain slots and resumes the awaiter via `PreciseWaitItem.Complete()` → `IValueTaskSource.SetResult()`.
+
+On the WaitableTimer HR path, `ThreadPool.RegisterWaitForSingleObject` is used. The `SafeWaitHandle` is wrapped in an `EventWaitHandle` to satisfy the `WaitHandle` parameter requirement.
+
+### 14.6 Lifecycle and Safety
+
+| Operation | Condition | Exception |
+| --- | --- | --- |
+| `Initialize(cpuCore)` | `cpuCore == 0` | `ArgumentException` |
+| `Initialize(cpuCore)` | Already initialized | `InvalidOperationException` |
+| `WaitAsync(...)` | Not initialized / after Shutdown | `InvalidOperationException` |
+| `WaitAsync(..., ct)` | `ct` already cancelled | `OperationCanceledException` |
+
+Inside `Initialize()`, a temporary variable is used for the `SpinCoreEngine` instance; it is assigned to `_engine` only after `Initialize()` succeeds. This prevents `IsInitialized` from being `true` after a failed initialization.
+
+### 14.7 Related Files
+
+| File | Content |
+| --- | --- |
+| [src/NativeClock.cs](../src/NativeClock.cs) | KUSER_SHARED_DATA direct-read timestamp |
+| [src/PreciseWaitItem.cs](../src/PreciseWaitItem.cs) | IValueTaskSource + ObjectPool wait item |
+| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) magic-number division timer wheel |
+| [src/SpinCoreEngine.cs](../src/SpinCoreEngine.cs) | Dedicated-core spin thread engine |
+| [src/PreciseDelay.cs](../src/PreciseDelay.cs) | Public API (Initialize / Shutdown / WaitAsync) |
+| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | All 18 tests |
+| [document/test_result.md](test_result.md) | Test result report (all 33 passed) |
 
 ---
 

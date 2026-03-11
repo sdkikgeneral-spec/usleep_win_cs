@@ -11,6 +11,7 @@ class Program
         UsleepWin.SetProfile(UsleepProfile.BALANCED);
         UsleepWin.SetTailSpinMicroseconds(250);
         UsleepWin.SetYieldPolicy(UsleepYieldPolicy.SLEEP0);
+        PreciseDelay.Initialize(dedicatedCpuCore: 3);
 
         // Deadline-based 1ms loop to reduce drift.
         const ulong tickUs = 1000;
@@ -29,5 +30,7 @@ class Program
             // Re-sync when overrun is large.
             if (late > 5000) next = now;
         }
+
+        PreciseDelay.Shutdown();
     }
 }

@@ -22,6 +22,7 @@
 11. [統計カウンタ](#11-統計カウンタ)
 12. [Unity 向けビルドの差異](#12-unity-向けビルドの差異)
 13. [セキュリティ・安全性](#13-セキュリティ安全性)
+14. [PreciseDelay 高精度非同期タイマー](#14-precisedelay-高精度非同期タイマー)
 
 ---
 
@@ -52,6 +53,7 @@
 | `USLP_WINDOWS` | Unity Windows-only DLL | `DllImport` + `SuppressUnmanagedCodeSecurity` を使用 |
 | `USLP_X64_ONLY` | NuGet x64 専用ビルド（オプション） | `X86Base.Pause()` を実行時分岐なしで直接呼び出す |
 | `USLP_NUGET` | NuGet ビルド識別子 | 現状は `USLP_GENERATOR` と併用。将来の条件分岐用 |
+| `USLP_UNITY` | Unity DLL（両バリアント） | `PreciseDelay` 関連の5ファイルをコンパイルから除外する（`#if !USLP_UNITY`） |
 
 **Generic ビルド（どちらも未定義）:**  
 すべての Win32 API 呼び出しがコンパイルから除外される。`Platform.IsWindows` は常に `false` を返すため、WaitableTimer・QPC・Sleep 系 API は一切呼ばれず、`Thread.Yield()` / `Thread.Sleep()` / `Stopwatch` ベースのフォールバック実装になる。
@@ -414,6 +416,99 @@ Unity 向けでは `USLP_X64_ONLY` は通常指定しない（マルチプラッ
 - **タイマーハンドルの共有なし**: `[ThreadStatic]` により各スレッドが独立したハンドルを保持
 - **タイマー分解能の重複設定防止**: `_timerResolutionLock` による排他制御で `timeBeginPeriod` の二重呼び出しを防止
 - **整数オーバーフロー**: `NowUs()` の QPC 計算 `c.QuadPart * 1_000_000L / _qpcFreq` は `long` 演算。QPC カウンタが `long.MaxValue / 1_000_000` を超えるのは数千年後であり実用上問題なし
+
+---
+
+---
+
+## 14. PreciseDelay 高精度非同期タイマー
+
+### 14.1 概要
+
+`PreciseDelay` は `UsleepWin` では達成できない **±1〜3 µs** 精度の非同期待機を提供する静的クラス。
+専用スピンスレッド・タイマーホイール・`IValueTaskSource` プールの組み合わせにより、**ゼロアロケーション**での高精度スケジューリングを実現する。
+
+NuGet ターゲット（`net10.0-windows`）専用。Unity DLL ビルドでは `#if !USLP_UNITY` により全5ファイルがコンパイルから除外される。
+
+### 14.2 クラス構成
+
+| クラス / ファイル | 役割 |
+| --- | --- |
+| `NativeClock` (`src/NativeClock.cs`) | `KUSER_SHARED_DATA`（アドレス `0x7FFE0000`）直読みによる ~1 ns タイムスタンプ取得。P/Invoke ゼロのホットパス。OS または値が非信頼の場合は `Stopwatch.GetTimestamp()` にフォールバック |
+| `PreciseWaitItem` (`src/PreciseWaitItem.cs`) | `IValueTaskSource` + `ObjectPool<T>` による待機アイテム。`ManualResetValueTaskSourceCore<bool>` でゼロアロケーション `ValueTask` を発行 |
+| `TimerWheel` (`src/TimerWheel.cs`) | スロット数 4096 のタイマーホイール。`Math.BigMul` を使ったマジックナンバー除算で O(1) スロット計算 |
+| `SpinCoreEngine` (`src/SpinCoreEngine.cs`) | 専用 CPU コアに固定されたスピンスレッド。`NtSetTimerResolution(1)` でシステムタイマー分解能を最小化し、`TimerWheel.Advance()` をタイトループで呼び出す |
+| `PreciseDelay` (`src/PreciseDelay.cs`) | 公開 API。≤5 ms はスピンパス、>5 ms は WaitableTimer HR パスに自動振り分け |
+
+### 14.3 NativeClock の実装
+
+`KUSER_SHARED_DATA` 構造体のオフセット `0x320`（`InterruptTime`）を `unsafe` ポインタで直接読む。
+64 ビット値が 2 回の 32 ビット読み取りにまたがるため、High → Low → High の順に読み取り、High が一致するまでリトライする（ティア読み取りパターン）。
+
+```text
+address = (byte*)0x7FFE0000 + 0x320
+loop:
+    hi1 = *(uint*)(address + 4)
+    lo  = *(uint*)(address)
+    hi2 = *(uint*)(address + 4)
+    if hi1 == hi2: return (long)((ulong)hi1 << 32 | lo)
+```
+
+値は 100 ns 単位。`Stopwatch.Frequency` ベースの係数でスケールし、`Stopwatch.GetTimestamp()` と同じ単位に変換する。
+
+### 14.4 TimerWheel の設計
+
+#### スロット計算（O(1) マジックナンバー除算）
+
+`ticksPerSlot = Stopwatch.Frequency / 1_000_000`（1 µs あたりのティック数）を構築時に計算し、その逆数に相当するマジックマルチプライヤを `ComputeMagicNumbers()` で導出する。
+
+```text
+slot = (diff × magicMultiplier) >> (magicShift - 64)  [上位 64 ビット]
+     & SlotMask
+```
+
+`diff = timestamp - _baseTimestamp`（`_baseTimestamp` は構築時に固定）。
+`long` の範囲内でオーバーフローするまでは **約 29,000 年**（QPC 周波数 ~10 MHz 基準）であり実用上問題なし。
+
+#### `ResetBase()` を削除した理由
+
+仕様書の初期版では `_baseTimestamp` をリセットする `ResetBase()` メソッドが存在したが、**既にキュー済みのアイテムのスロットインデックスが旧 base 基準で格納されているため、リセット後に最大 ~4 ms の遅延が発生するバグ**が判明した。`_baseTimestamp` を `readonly` にして構築時1回だけ設定することで問題を根本解消した。
+
+### 14.5 WaitAsync のルーティング
+
+```text
+delay ≤ 0          → 即完了（ValueTask.CompletedTask 相当）
+0 < delay ≤ 5 ms   → SpinCoreEngine キューに enqueue（スピンパス）
+delay > 5 ms       → WaitableTimerAsync（WaitableTimer HR パス）
+```
+
+スピンパスでは `PreciseWaitItemPool.Rent()` でアイテムを取得し、`TimerWheel.Enqueue()` でデッドライン付きでキューイングする。
+SpinCoreEngine のスピンループが `TimerWheel.Advance()` を呼び出してスロットを消化し、`PreciseWaitItem.Complete()` → `IValueTaskSource.SetResult()` で待機側を再開する。
+
+WaitableTimer HR パスでは `ThreadPool.RegisterWaitForSingleObject` を使用する。`SafeWaitHandle` を `EventWaitHandle` でラップして `WaitHandle` 型要件を満たす。
+
+### 14.6 ライフサイクルと安全性
+
+| 操作 | 条件 | 例外 |
+| --- | --- | --- |
+| `Initialize(cpuCore)` | `cpuCore == 0` | `ArgumentException` |
+| `Initialize(cpuCore)` | 既に初期化済み | `InvalidOperationException` |
+| `WaitAsync(...)` | 未初期化 / Shutdown 後 | `InvalidOperationException` |
+| `WaitAsync(..., ct)` | `ct` が既にキャンセル済み | `OperationCanceledException` |
+
+`Initialize()` 内では `SpinCoreEngine` の一時変数に代入してから `Initialize()` を呼び、成功した場合のみ `_engine` フィールドに代入する（例外時に `IsInitialized` が `true` になるバグを防止）。
+
+### 14.7 関連ファイル
+
+| ファイル | 内容 |
+| --- | --- |
+| [src/NativeClock.cs](../src/NativeClock.cs) | KUSER_SHARED_DATA 直読みタイムスタンプ |
+| [src/PreciseWaitItem.cs](../src/PreciseWaitItem.cs) | IValueTaskSource + ObjectPool 待機アイテム |
+| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) マジックナンバー除算タイマーホイール |
+| [src/SpinCoreEngine.cs](../src/SpinCoreEngine.cs) | 専用コアスピンスレッドエンジン |
+| [src/PreciseDelay.cs](../src/PreciseDelay.cs) | 公開 API（Initialize / Shutdown / WaitAsync） |
+| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | 全 18 件のテスト |
+| [document/test_result.md](test_result.md) | テスト結果レポート（全 33 件合格） |
 
 ---
 

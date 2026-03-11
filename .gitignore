@@ -5,3 +5,5 @@ samples/ConsoleDemo/bin/
 samples/ConsoleDemo/obj/
 unity/bin/
 unity/obj/
+tests/UsleepWin.Tests/bin/
+tests/UsleepWin.Tests/obj/
