@@ -2,7 +2,6 @@
 #if !USLP_UNITY
 
 using System;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
@@ -75,29 +74,15 @@ public static class PreciseDelay
 
     // ── WaitableTimer HR フォールバック ──────────────────────────
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern SafeWaitHandle CreateWaitableTimerExW(
-        IntPtr lpTimerAttributes, string? lpTimerName,
-        uint dwFlags, uint dwDesiredAccess);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetWaitableTimer(
-        SafeWaitHandle hTimer, ref long lpDueTime,
-        int lPeriod, IntPtr pfnCompletionRoutine,
-        IntPtr lpArgToCompletionRoutine, bool fResume);
-
-    private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
-    private const uint TIMER_ALL_ACCESS = 0x1F0003;
-
     private static async Task WaitableTimerAsync(TimeSpan delay, CancellationToken ct)
     {
-        var handle = CreateWaitableTimerExW(
+        var handle = NativeMethods.CreateWaitableTimerExSafe(
             IntPtr.Zero, null,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-            TIMER_ALL_ACCESS);
+            NativeMethods.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            NativeMethods.TIMER_ALL_ACCESS);
 
         long dueTime = -(delay.Ticks);
-        SetWaitableTimer(handle, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false);
+        NativeMethods.SetWaitableTimerSafe(handle, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false);
 
         var tcs = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously);

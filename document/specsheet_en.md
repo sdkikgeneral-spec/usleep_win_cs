@@ -1,6 +1,6 @@
 # usleep_win_cs Internal Specification
 
-> Version: 0.1.x  
+> Version: 0.2.x
 > Audience: Library developers and contributors
 
 [日本語版](specsheet.md)
@@ -80,10 +80,14 @@ Uses the source generator approach available since .NET 7. Marshalling code is g
 - **`CreateWaitableTimerEx`**  
   Explicitly specifies the Unicode entry point `CreateWaitableTimerExW` with `StringMarshalling.Utf16`.
 
-- **`SetWaitableTimer`**  
+- **`SetWaitableTimer`**
   Passes the due time as `ref LARGE_INTEGER` (negative value in 100-ns units = relative time).
 
-- **`SetThreadInformation`**  
+- **`CreateWaitableTimerExSafe` / `SetWaitableTimerSafe`** (`SafeWaitHandle` overloads)
+  Used exclusively by `PreciseDelay.WaitableTimerAsync` (the async fallback path). These variants accept/return a `SafeWaitHandle` instead of `IntPtr`.
+  The actual entry points are `CreateWaitableTimerExW` and `SetWaitableTimer` respectively (declared via the `EntryPoint` attribute).
+
+- **`SetThreadInformation`**
   Passes `THREAD_POWER_THROTTLING_STATE` by `ref` to configure thread power throttling.
 
 ### 3.2 Unity Windows Build: `DllImport` (`USLP_WINDOWS`)
@@ -103,22 +107,33 @@ No P/Invoke. All Win32 branches are excluded from compilation.
 ### Priority Order
 
 ```
-1. QPC path (USLP_WINDOWS || USLP_GENERATOR, _isWin == true, _qpcFreq > 0)
+[USLP_GENERATOR — NuGet build]
+
+1. NativeClock path (Stopwatch.IsHighResolution == true)
+   NativeClock.GetTimestamp() * _tickToUs
+   ※ KUSER_SHARED_DATA direct read (~1 ns). Falls back to Stopwatch internally
+     on unsupported systems.
+
+2. TickCount fallback (Stopwatch.IsHighResolution == false)
+   (ulong)(uint)Environment.TickCount * 1000UL
+
+[USLP_WINDOWS — Unity Windows build]
+
+1. QPC path (_isWin == true, _qpcFreq > 0)
    QueryPerformanceCounter(out c)
    → (ulong)(c.QuadPart * 1_000_000L / _qpcFreq)
 
 2. Stopwatch path (Stopwatch.IsHighResolution == true)
    Stopwatch.GetTimestamp() * _tickToUs
-   ※ _tickToUs = 1_000_000.0 / Stopwatch.Frequency (cached at static init)
 
 3. TickCount fallback (Stopwatch.IsHighResolution == false)
    (ulong)(uint)Environment.TickCount * 1000UL
-   ※ Millisecond → microsecond conversion; 1 ms resolution
 ```
 
 ### Accuracy Notes
 
-- QPC: typically ±1 µs or better. Frequency is cached in `_qpcFreq` at startup.
+- NativeClock (NuGet): equivalent accuracy to QPC (±1 µs or better) with zero P/Invoke overhead (~1 ns).
+- QPC (Unity Windows): typically ±1 µs or better. Frequency is cached in `_qpcFreq` at startup.
 - Stopwatch (high-resolution): equivalent to QPC (most environments use QPC internally).
 - TickCount fallback: 1 ms granularity; used only on non-Windows or non-high-resolution systems.
 
@@ -333,7 +348,7 @@ The following fields are all `[ThreadStatic]`. Each thread holds its own indepen
 |---|---|---|
 | `_timerResolutionMs` | `uint` | Currently requested timer resolution (ms); 0 = not set |
 | `_timerResolutionLock` | `object` | Exclusive lock for `timeBeginPeriod` calls |
-| `_qpcFreq` | `long` | QPC frequency (cached at startup) |
+| `_qpcFreq` | `long` | QPC frequency (cached at startup). Used only in `USLP_WINDOWS` builds; fixed at 0 in NuGet builds. |
 | `_isWin` | `bool` | Whether running on Windows (determined at startup) |
 | `_hires` | `bool` | `Stopwatch.IsHighResolution` |
 | `_tickToUs` | `double` | Stopwatch tick-to-µs conversion coefficient |
@@ -402,7 +417,7 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 | `AggressiveOptimization` | Enabled | Disabled | Disabled |
 | `SkipLocalsInit` | Enabled | Disabled | Disabled |
 | CPU-specific instructions (PAUSE/YIELD) | Enabled (runtime branch) | `SpinWait` | `SpinWait` |
-| `SuppressGCTransition` | Enabled (QPC calls) | Disabled | — |
+| `SuppressGCTransition` | Declared (QPC calls) / not used in hot path | Disabled | — |
 | `SuppressUnmanagedCodeSecurity` | Disabled (not needed) | Enabled | — |
 
 `USLP_X64_ONLY` is not normally set for Unity builds since they must support multiple platforms.
@@ -416,7 +431,7 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 - **Internal exception handling**: `EntryPointNotFoundException` is caught inside `GetTimer()` and does not propagate to callers.
 - **No cross-thread handle sharing**: `[ThreadStatic]` ensures each thread owns its timer handle exclusively.
 - **Timer resolution double-call prevention**: `_timerResolutionLock` serializes `timeBeginPeriod` calls, preventing race conditions.
-- **Integer overflow in `NowUs()`**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice.
+- **Integer overflow in `NowUs()` (Unity / `USLP_WINDOWS`)**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice. In NuGet builds, `NativeClock.GetTimestamp() * _tickToUs` (floating-point multiplication) is used instead, so integer overflow does not apply.
 
 ---
 

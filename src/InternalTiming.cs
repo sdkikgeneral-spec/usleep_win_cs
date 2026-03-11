@@ -22,12 +22,11 @@ internal static class InternalTiming
 
     private static long InitQpc()
     {
-#if USLP_WINDOWS || USLP_GENERATOR
+#if USLP_WINDOWS
+        // USLP_GENERATOR は NativeClock を使うため QPC 周波数は不要
         if (_isWin && QueryPerformanceFrequency(out var f)) return f.QuadPart;
-        return 0;
-#else
-        return 0;
 #endif
+        return 0;
     }
 
 #if USLP_GENERATOR
@@ -35,7 +34,12 @@ internal static class InternalTiming
 #endif
     internal static ulong NowUs()
     {
-#if USLP_WINDOWS || USLP_GENERATOR
+#if USLP_GENERATOR
+        // NativeClock: KUSER_SHARED_DATA直読み (~1ns、P/Invokeゼロ)。
+        // 信頼性検証済み。非対応環境では内部で Stopwatch にフォールバック済み。
+        if (_hires)
+            return (ulong)(Usleep.Win.NativeClock.GetTimestamp() * _tickToUs);
+#elif USLP_WINDOWS
         if (_isWin && _qpcFreq > 0 && QueryPerformanceCounter(out var c))
             return (ulong)((c.QuadPart * 1_000_000L) / _qpcFreq);
 #endif

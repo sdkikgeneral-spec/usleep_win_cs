@@ -5,6 +5,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Security;
+using Microsoft.Win32.SafeHandles;
 
 internal static partial class NativeMethods
 {
@@ -85,6 +86,18 @@ internal static partial class NativeMethods
 
     [LibraryImport("winmm.dll", SetLastError = true)]
     internal static partial uint timeEndPeriod(uint uPeriod);
+
+    // --- PreciseDelay async path (SafeWaitHandle overloads) ---
+    [LibraryImport("kernel32.dll", EntryPoint = "CreateWaitableTimerExW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    internal static partial SafeWaitHandle CreateWaitableTimerExSafe(
+        IntPtr lpTimerAttributes, string? lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "SetWaitableTimer", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool SetWaitableTimerSafe(
+        SafeWaitHandle hTimer, ref long lpDueTime, int lPeriod,
+        IntPtr pfnCompletionRoutine, IntPtr lpArgToCompletionRoutine,
+        [MarshalAs(UnmanagedType.Bool)] bool fResume);
 
 #elif USLP_WINDOWS
     // ==============================

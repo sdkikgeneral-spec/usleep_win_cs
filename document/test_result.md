@@ -1,6 +1,7 @@
 # テスト結果レポート
 
-**実施日**: 2026-03-11
+**初回実施日**: 2026-03-11
+**直近再実施日**: 2026-03-11（NativeClock 統合・P/Invoke 重複排除後）
 **対象プロジェクト**: `tests/UsleepWin.Tests/UsleepWin.Tests.csproj`
 **ターゲットフレームワーク**: `net10.0-windows`
 **テストフレームワーク**: xUnit 2.x
@@ -12,7 +13,7 @@
 | テスト合計 | 33 |
 | 成功 | 33 |
 | 失敗 | 0 |
-| 合計時間 | 0.833 秒 |
+| 合計時間 | 0.221 秒 |
 
 ---
 
@@ -95,6 +96,33 @@ _engine = engine;
 **原因**: `_baseTimestamp` を更新・`_currentSlot = 0` にリセットすると、既にキュー済みのアイテムのスロットインデックス（旧 base 基準）が無効になる。
 **修正**: `_baseTimestamp` を構築時1回だけ設定し、`ResetBase()` を削除（[src/TimerWheel.cs](../src/TimerWheel.cs)）。
 `diff = timestamp - _baseTimestamp` は int64 の範囲内で約29,000年分扱えるためオーバーフローは実用上問題なし。
+
+---
+
+## アーキテクチャ改善（NativeClock 統合・P/Invoke 整理）
+
+2026-03-11 の再実施時に以下の内部改善を施し、全 33 テストの通過を確認した。
+
+### 改善1: `InternalTiming.NowUs()` を NativeClock に統一（NuGet ビルド）
+
+**変更前（USLP_GENERATOR）**: `QueryPerformanceCounter()` P/Invoke（~500 ns オーバーヘッド）
+**変更後（USLP_GENERATOR）**: `NativeClock.GetTimestamp()`（KUSER_SHARED_DATA 直読み、~1 ns）
+`NativeClock` は非対応環境で内部的に `Stopwatch.GetTimestamp()` へフォールバックするため後退互換性あり。
+Unity ビルド（`USLP_WINDOWS`）は従来通り QPC を使用。
+
+変更ファイル: [src/InternalTiming.cs](../src/InternalTiming.cs)
+
+### 改善2: P/Invoke 宣言の重複排除
+
+**変更前**: `PreciseDelay.cs` 内に `[DllImport]` 宣言が 2 つ・定数が 2 つ独立して存在していた。
+**変更後**: `NativeMethods.Partial.cs` の `USLP_GENERATOR` ブロックに `SafeWaitHandle` 版 2 宣言を追加し、`PreciseDelay.cs` から重複コードを削除。
+
+| 追加宣言 | エントリポイント |
+| --- | --- |
+| `CreateWaitableTimerExSafe(...)` → `SafeWaitHandle` | `CreateWaitableTimerExW` |
+| `SetWaitableTimerSafe(SafeWaitHandle, ref long, ...)` | `SetWaitableTimer` |
+
+変更ファイル: [src/Interop/NativeMethods.Partial.cs](../src/Interop/NativeMethods.Partial.cs), [src/PreciseDelay.cs](../src/PreciseDelay.cs)
 
 ---
 
