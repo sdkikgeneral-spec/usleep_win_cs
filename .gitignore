@@ -7,3 +7,4 @@ unity/bin/
 unity/obj/
 tests/UsleepWin.Tests/bin/
 tests/UsleepWin.Tests/obj/
+*.zip
