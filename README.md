@@ -1,3 +1,8 @@
+# Overview
+
+This repository provides a minimal, open-source C# implementation of `usleep` for Windows,
+maintained as a supporting utility within a broader cross-platform and education-oriented software ecosystem.
+
 # usleep_win_cs
 
 [![NuGet](https://img.shields.io/nuget/v/usleep_win_cs)](https://www.nuget.org/packages/usleep_win_cs)
