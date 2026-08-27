@@ -25,7 +25,7 @@ model: sonnet
    `USLP_GENERATOR` 側だけに存在する API（`CreateWaitableTimerExSafe` / `SetWaitableTimerSafe` など）は、`#if !USLP_UNITY` 内からのみ参照されているか。
 
 2. **`#if !USLP_UNITY` の除外境界**
-   `PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem` / `NativeClock` は Unity ビルドから丸ごと落ちる。
+   `PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem` は Unity ビルドから丸ごと落ちる。
    これらの型が、除外されないファイル（`InternalTiming` など）から**無防備に参照されていないか**。参照する場合は必ず `#if USLP_GENERATOR` などのガード内にあること。
 
 3. **netstandard2.1 で使えない API の混入**

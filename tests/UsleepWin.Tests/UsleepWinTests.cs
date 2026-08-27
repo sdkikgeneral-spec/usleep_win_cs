@@ -160,4 +160,34 @@ public class UsleepWinTests
         Assert.Equal(0UL, after.SpinRelax);
         Assert.Equal(0UL, after.WaitableTimerUses);
     }
+
+    // ── SetPowerMode ───────────────────────────────────────────────
+    //
+    // ThreadPowerThrottling の列挙値が誤っていた頃（3 ではなく 11）は
+    // SetThreadInformation が ERROR_INVALID_PARAMETER で失敗し、
+    // 全モードで false が返っていた。戻り値そのものを検証する。
+
+    [Theory]
+    [InlineData(UsleepPowerMode.DEFAULT)]
+    [InlineData(UsleepPowerMode.PERF)]
+    [InlineData(UsleepPowerMode.ECO)]
+    public void SetPowerMode_ValidMode_Succeeds(UsleepPowerMode mode)
+    {
+        try
+        {
+            Assert.True(Usleep.Win.UsleepWin.SetPowerMode(mode),
+                $"SetPowerMode({mode}) が false を返した");
+        }
+        finally
+        {
+            // このスレッドの設定を OS 既定へ戻す
+            Usleep.Win.UsleepWin.SetPowerMode(UsleepPowerMode.DEFAULT);
+        }
+    }
+
+    [Fact]
+    public void SetPowerMode_OutOfRange_ReturnsFalse()
+    {
+        Assert.False(Usleep.Win.UsleepWin.SetPowerMode((UsleepPowerMode)99));
+    }
 }

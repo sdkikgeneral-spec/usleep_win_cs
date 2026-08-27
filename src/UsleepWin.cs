@@ -116,15 +116,43 @@ namespace Usleep.Win
         /// </summary>
         /// <param name="mode">Requested power mode.</param>
         /// <returns>True if the mode is applied; otherwise false.</returns>
+        /// <remarks>
+        /// Applies to the calling thread only. It does not affect the
+        /// <c>PreciseDelay</c> spin thread or any other thread.
+        /// Requires Windows 10 1709 or later; returns false where thread power
+        /// throttling is unavailable.
+        /// </remarks>
         public static bool SetPowerMode(UsleepPowerMode mode)
         {
+            if (!Enum.IsDefined(typeof(UsleepPowerMode), mode)) return false;
 #if USLP_WINDOWS || USLP_GENERATOR
             if (!Platform.IsWindows) return false;
+
+            // ControlMask は「どのスロットリングを自分で制御するか」、StateMask は
+            // 「それを有効にするか」。DEFAULT で ControlMask を立てたままにすると
+            // OS 既定に戻らず PERF と同じ扱いになるため、3 モードを区別する。
+            uint controlMask, stateMask;
+            switch (mode)
+            {
+                case UsleepPowerMode.ECO:
+                    controlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+                    stateMask   = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+                    break;
+                case UsleepPowerMode.PERF:
+                    controlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+                    stateMask   = 0u;
+                    break;
+                default: // DEFAULT: OS 既定の挙動に戻す
+                    controlMask = 0u;
+                    stateMask   = 0u;
+                    break;
+            }
+
             var state = new THREAD_POWER_THROTTLING_STATE
             {
-                Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
-                ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
-                StateMask   = (mode == UsleepPowerMode.ECO) ? THREAD_POWER_THROTTLING_EXECUTION_SPEED : 0u
+                Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask = controlMask,
+                StateMask   = stateMask
             };
             return SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
                 ref state, (uint)System.Runtime.InteropServices.Marshal.SizeOf<THREAD_POWER_THROTTLING_STATE>());

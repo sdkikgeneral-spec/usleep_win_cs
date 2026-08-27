@@ -96,6 +96,9 @@ Copy-BuildOutput -SrcDir $unitySrc -DstDir $unityGenericDst
 Write-Host ""
 Write-Host "── Step 3: Unity Windows ビルド (netstandard2.1) ───────────────" -ForegroundColor Yellow
 Invoke-Dotnet @("build", "unity\usleep_win_cs.unity.csproj", "-c", "Release", "--no-restore",
+              # PowerShell では %3B のままで正しい（cmd と違い % を解釈しない）。
+              # build_unity_windows.bat 側は %%3B とエスケープする必要がある。
+              # 表記が違うのは意図的なので、どちらかに揃えないこと。
               "-p:DefineConstants=USLP_UNITY%3BUSLP_WINDOWS")
 
 $unityWindowsDst = Join-Path $stagingDir "unity_windows\netstandard2.1"

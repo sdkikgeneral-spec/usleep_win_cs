@@ -47,9 +47,9 @@ dotnet test tests\UsleepWin.Tests\UsleepWin.Tests.csproj --filter "DisplayName~S
 | Unity Windows | `netstandard2.1` | `USLP_WINDOWS` のみ |
 | Unity Generic | `netstandard2.1` | `USLP_UNITY`（Win32 分岐は全除外） |
 
-- `USLP_GENERATOR` … `LibraryImport` source generator、`AggressiveOptimization`、`SkipLocalsInit`、`NativeClock` パスを有効化
+- `USLP_GENERATOR` … `LibraryImport` source generator、`AggressiveOptimization`、`SkipLocalsInit` を有効化
 - `USLP_WINDOWS` … 従来の `DllImport` + `SuppressUnmanagedCodeSecurity`
-- `USLP_UNITY` … `PreciseDelay` 系 5 ファイル（`PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem` / `NativeClock`）を `#if !USLP_UNITY` で丸ごと除外
+- `USLP_UNITY` … `PreciseDelay` 系 4 ファイル（`PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem`）を `#if !USLP_UNITY` で丸ごと除外
 - `USLP_X64_ONLY` … `X86Base.Pause()` を実行時分岐なしで直接発行
 
 ## アーキテクチャ
@@ -61,14 +61,13 @@ dotnet test tests\UsleepWin.Tests\UsleepWin.Tests.csproj --filter "DisplayName~S
 ```
 UsleepWin (public API / スレッドローカル設定)
   └─ InternalTiming (NowUs / SleepByTimer / SpinWithPeriodicYield / CoarseYield)
-       ├─ NativeClock   … KUSER_SHARED_DATA 直読み（USLP_GENERATOR のみ）
        ├─ SpinHints     … PAUSE / YIELD / SpinWait
        └─ NativeMethods … P/Invoke（3 分岐 partial クラス）
 ```
 
 - **設定はすべて `[ThreadStatic]`**（profile / tailSpin / yieldPolicy / 統計カウンタ）。スレッドをまたいで継承されない。`WaitableTimer` ハンドルもスレッドごとにキャッシュされる。
 - `SleepMicroseconds` はプロファイルごとの閾値（`timerFirstUs` / `preferSpinBelow`）で「タイマー主体」か「スピン主体」かを分岐し、最後の `tailSpinUs` 区間は必ずスピンで詰める、という 2 段構成。
-- `InternalTiming.NowUs()` の実装優先度はバリアントごとに異なる（NuGet: NativeClock → Stopwatch → TickCount / Unity Windows: QPC → Stopwatch → TickCount）。
+- `InternalTiming.NowUs()` の実装優先度はバリアントごとに異なる（NuGet: Stopwatch → TickCount / Unity Windows: QPC → Stopwatch → TickCount）。
 - `NativeMethods` は `#if USLP_GENERATOR` / `#elif USLP_WINDOWS` / `#else`(空) の 3 分岐。**API を追加するときは Generator 版と DllImport 版の両方に、同じシグネチャで足す必要がある。**
 
 ### 系統 2: `PreciseDelay`（非同期、±1〜3 µs、NuGet ビルド専用）
@@ -83,7 +82,7 @@ PreciseDelay (public API)
 ```
 
 守るべき不変条件:
-- `SpinCoreEngine` の**ホットパスでは P/Invoke を一切呼ばない**。アフィニティ・優先度・タイマー分解能の設定は `SpinLoop` 冒頭で 1 回だけ。時刻取得は `NativeClock.GetTimestamp()`（P/Invoke ゼロ）。
+- `SpinCoreEngine` の**ホットパスでは P/Invoke を一切呼ばない**。アフィニティ・優先度・タイマー分解能の設定は `SpinLoop` 冒頭で 1 回だけ。時刻取得は `Stopwatch.GetTimestamp()`。
 - `PreciseWaitItem.Complete()` / `CompleteAsCancelled()` は**スピンスレッドのみ**が呼ぶ前提で `Interlocked` を使っていない。use-after-free は `IsInitialized` フラグで防いでいる。
 - コア 0 の指定は `ArgumentException`、RealTime 優先度クラスでの実行は `SecurityException`。
 - `PreciseDelay` は静的状態を持つため、テストは `[Collection("PreciseDelay")]`（`DisableParallelization = true`）で直列実行する。新しい `PreciseDelay` テストも必ずこのコレクションに入れること。
@@ -116,6 +115,7 @@ PreciseDelay (public API)
 主な構造上の非対称:
 
 - **C++ 側にのみ存在** — `DllMain` によるハンドル解放とタイマー分解能復帰、`usleep_*_nt_resolution` の公開 API、C ABI / `.rc` バージョン整合
-- **C# 側にのみ存在** — `PreciseDelay` 系（非同期・専用スピンスレッド）、`NativeClock` の `KUSER_SHARED_DATA` 直読み、3 ビルドバリアント
+- **C# 側にのみ存在** — `PreciseDelay` 系（非同期・専用スピンスレッド）、3 ビルドバリアント
 - **同概念・別実装** — C++ の `qpc_now_us()` は浮動小数点を使わない純整数演算。C# の `NowUs()` は `_tickToUs`（double）を掛ける
+- **時刻源** — NuGet ビルドは `Stopwatch.GetTimestamp()`。かつて `KUSER_SHARED_DATA` 直読みの `NativeClock` があったが、読んでいた QpcBias が単調増加カウンタでなく常にフォールバックしていたため撤去した。**復活させないこと**
 - C++ の `t_timer` は `DLL_THREAD_DETACH` でクローズされるが、C# の `[ThreadStatic] _tTimer` はクローズされない（スレッド終了時にリーク）

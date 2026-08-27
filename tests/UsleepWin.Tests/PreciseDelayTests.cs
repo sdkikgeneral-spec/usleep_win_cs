@@ -230,4 +230,146 @@ public class PreciseDelayWaitTests : IClassFixture<PreciseDelayFixture>
         // 例外なく全タスクが完了すること
         Assert.All(tasks, t => Assert.Equal(TaskStatus.RanToCompletion, t.Status));
     }
+
+    // ── スピン経路の上限付近の契約テスト ───────────────────────────
+    //
+    // ホイールは 1 スロット = 1µs。スロット数より長い deadline を入れると
+    // 折り返して「過去のスロット」に落ち、要求より早く完了する。
+    // スピン経路の上限（5ms）とホイールの表現範囲の関係が崩れると
+    // ここが最初に壊れるので、境界付近を押さえておく。
+    //
+    // 注: これは過去の不具合の再現テストではない。旧実装は magic 除算の
+    // 乗数が桁溢れしていて 1 スロットが約 2.67µs あり（実効範囲 ≒10.9ms）、
+    // 5ms は折り返していなかった。旧実装の実害は早期完了ではなく
+    // 「スロット粒度が 1µs でなく 2.67µs」という精度劣化。
+    //
+    // 上限だけのアサートでは即 return しても通ってしまうので、下限を主役にする。
+
+    [Theory]
+    [InlineData(4200)]
+    [InlineData(4500)]
+    [InlineData(5000)] // スピン経路の上限ちょうど
+    public async Task WaitAsync_NearSpinPathUpperBound_DoesNotReturnEarly(int targetUs)
+    {
+        // 1 回の外れ値で落とさないよう、中央値で判定する
+        const int iterations = 5;
+        var samples = new long[iterations];
+
+        for (int i = 0; i < iterations; i++)
+        {
+            var sw = Stopwatch.StartNew();
+            await PreciseDelay.WaitAsync(TimeSpan.FromMicroseconds(targetUs));
+            sw.Stop();
+            samples[i] = sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+        }
+
+        Array.Sort(samples);
+        long medianUs = samples[iterations / 2];
+
+        // 下限: 早期完了の検出が目的。計測系の誤差ぶんだけ緩める
+        Assert.True(medianUs >= targetUs - 100,
+            $"要求 {targetUs}µs に対し中央値 {medianUs}µs で早期完了した"
+            + $"（実測: {string.Join(", ", samples)}）");
+
+        // 上限: 折り返しの反対側（一周待たされる）も検出する
+        Assert.True(medianUs < targetUs + 2000,
+            $"要求 {targetUs}µs に対し中央値 {medianUs}µs は遅すぎる"
+            + $"（実測: {string.Join(", ", samples)}）");
+    }
+
+    [Fact]
+    public async Task WaitAsync_LargeBurstOfShortWaits_AllComplete()
+    {
+        const int count = 3000;
+
+        var tasks = new Task[count];
+        for (int i = 0; i < count; i++)
+            tasks[i] = PreciseDelay.WaitAsync(TimeSpan.FromMicroseconds(50)).AsTask();
+
+        var all      = Task.WhenAll(tasks);
+        var finished = await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        Assert.True(ReferenceEquals(finished, all),
+            "10 秒以内に完了しなかった（待機項目の取りこぼしの疑い）");
+        await all;
+        Assert.All(tasks, t => Assert.Equal(TaskStatus.RanToCompletion, t.Status));
+    }
+}
+
+/// <summary>
+/// TimerWheel の境界条件を直接検証する。
+/// PreciseDelay 越しではスピンスレッドのプリエンプトを再現できず、
+/// 過去 deadline の大量投入やホイール範囲外の経路を踏めないため。
+/// </summary>
+public class TimerWheelBoundaryTests
+{
+    private const long RequiredSpanUs = PreciseDelay.SpinPathMaxMilliseconds * 1000L;
+
+    // ── 過去 deadline の大量投入 ───────────────────────────────────
+    //
+    // スピンスレッドがプリエンプトされている間に待機要求が溜まると、
+    // 再開後の drain で「既に締切を過ぎた」項目が大量に処理される。
+    // これらを 1 スロットへまとめて押し込む実装だと MaxSlotCapacity(1024) を
+    // 超えて GrowSlot が InvalidOperationException を投げ、呼び出し元である
+    // スピンスレッドごとプロセスが落ちる。
+
+    [Fact]
+    public void Enqueue_ManyPastDeadlines_CompletesAllWithoutThrowing()
+    {
+        var  wheel = new TimerWheel(RequiredSpanUs);
+        long now   = Stopwatch.GetTimestamp();
+        wheel.Advance(now);
+
+        const int count      = 3000; // MaxSlotCapacity(1024) を十分に超える
+        long      oneMsTicks = Stopwatch.Frequency / 1000;
+
+        var items = new PreciseWaitItem[count];
+        var waits = new ValueTask[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            items[i] = PreciseWaitItemPool.Rent(default);
+            waits[i] = items[i].AsValueTask();
+            // すべて 1ms 前 = 既に締切を過ぎている
+            wheel.Enqueue(items[i], now - oneMsTicks);
+        }
+
+        // 過ぎた締切はその場で完了していること（次の Advance を待たない）
+        for (int i = 0; i < count; i++)
+            Assert.True(waits[i].IsCompleted, $"{i} 件目が完了していない");
+    }
+
+    // ── ホイール範囲内の deadline は早期完了しない ─────────────────
+
+    [Fact]
+    public void Enqueue_DeadlineWithinSpan_DoesNotCompleteBeforeAdvance()
+    {
+        var  wheel = new TimerWheel(RequiredSpanUs);
+        long now   = Stopwatch.GetTimestamp();
+        wheel.Advance(now);
+
+        long deadline = now + RequiredSpanUs * (Stopwatch.Frequency / 1_000_000L);
+
+        var item = PreciseWaitItemPool.Rent(default);
+        var wait = item.AsValueTask();
+        wheel.Enqueue(item, deadline);
+
+        // 締切前は完了しない
+        wheel.Advance(deadline - Stopwatch.Frequency / 1000); // 1ms 手前
+        Assert.False(wait.IsCompleted, "締切前に完了した（折り返しの疑い）");
+
+        // 締切を過ぎたら完了する
+        wheel.Advance(deadline + Stopwatch.Frequency / 1000); // 1ms 過ぎ
+        Assert.True(wait.IsCompleted, "締切を過ぎても完了しない");
+    }
+
+    // ── 必要スパンを満たせない場合は構築に失敗する ─────────────────
+
+    [Fact]
+    public void Constructor_RequiredSpanTooLarge_Throws()
+    {
+        // 現実的にありえない広さを要求して、実行時検証が働くことを確認する
+        Assert.Throws<NotSupportedException>(
+            () => new TimerWheel(long.MaxValue / 2));
+    }
 }

@@ -15,7 +15,11 @@ internal static partial class NativeMethods
     internal const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
 
     // Power throttling constants
-    internal const int ThreadPowerThrottling = 11;
+    // THREAD_INFORMATION_CLASS の ThreadPowerThrottling は列挙値 3。
+    // （ThreadMemoryPriority=0 / ThreadAbsoluteCpuPriority=1 / ThreadDynamicCodePolicy=2）
+    // ここが 11 だと SetThreadInformation が ERROR_INVALID_PARAMETER(87) で失敗し、
+    // UsleepWin.SetPowerMode() が全モードで常に false を返していた。
+    internal const int ThreadPowerThrottling = 3;
     internal const uint THREAD_POWER_THROTTLING_CURRENT_VERSION = 1;
     internal const uint THREAD_POWER_THROTTLING_EXECUTION_SPEED = 0x1;
 

@@ -1,6 +1,6 @@
 ---
 name: interop-concurrency-reviewer
-description: P/Invoke、unsafe ポインタ操作、スレッド安全性、ハンドル・プールのライフサイクルをレビューする。NativeClock の KUSER_SHARED_DATA 直読み、SpinCoreEngine のロックフリー設計、PreciseWaitItem の use-after-free、WaitableTimer ハンドルのリークなど、壊れると再現困難な不具合になる箇所を触った後に使う。読み取り専用でレビューのみ行う。
+description: P/Invoke、unsafe ポインタ操作、スレッド安全性、ハンドル・プールのライフサイクルをレビューする。SpinCoreEngine のロックフリー設計、PreciseWaitItem の use-after-free、WaitableTimer ハンドルのリークなど、壊れると再現困難な不具合になる箇所を触った後に使う。読み取り専用でレビューのみ行う。
 tools: Read, Grep, Glob, Bash, LSP
 model: opus
 ---
@@ -9,11 +9,11 @@ model: opus
 
 ## 重点レビュー対象
 
-### 1. `NativeClock`（`src/NativeClock.cs`）
-- `KUSER_SHARED_DATA`（`0x7FFE0000`）の直読み。`unsafe` かつ OS の内部レイアウト依存。
-- オフセット `0x3B8`（bias）/ `0x3C4`（shift）を変える提案は、Windows のバージョン差を検証せずに行わない。
-- 静的コンストラクタでの信頼性検証（OS バージョン判定 + QPC との差分）と `_ksd == null` フォールバックが、**あらゆる経路で維持されているか**。
-- `AccessViolationException` は .NET では通常キャッチできない点を踏まえ、フォールバックが実際に機能するかを疑う。
+### 1. 時刻源（`src/InternalTiming.cs`）
+- 時刻源は `Stopwatch.GetTimestamp()`（内部で QPC、実測 ~20 ns/call）。
+- **`KUSER_SHARED_DATA`（`0x7FFE0000`）直読みの復活提案を通さない。** かつて `NativeClock` として存在したが、読んでいた `0x3B8`（QpcBias）は単調増加カウンタではなく（実測で 50ms 後も差分 0）、shift として読んでいた `0x3C4` は ActiveGroupCount（本来の QpcShift は `0x3C7`）だった。信頼性検証が常に失敗して結局フォールバックしており、`Interlocked.MemoryBarrierProcessWide()`（実測 88 ns/call）のぶん遅かった。
+- Unity Windows パスの QPC 計算 `c.QuadPart * 1_000_000L / _qpcFreq` は `long` オーバーフローに注意（QPC 10MHz でブートから ~28 時間で溢れる）。C++ 版は商・剰余に分けた純整数演算で回避している。
+- `AccessViolationException` は .NET では通常キャッチできない。これに依存したフォールバックを認めない。
 
 ### 2. `SpinCoreEngine`（`src/SpinCoreEngine.cs`）
 - **ホットパス（`SpinLoop` のループ内）で P/Invoke を呼んでいないか。** アフィニティ・優先度・`NtSetTimerResolution` は起動時 1 回のみ。

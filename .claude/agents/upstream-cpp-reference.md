@@ -42,14 +42,14 @@ model: opus
 | `usleep_init/shutdown_timer_resolution` | `InitTimerResolution(uint)` / `ShutdownTimerResolution()` |
 | `kProfileThresholds[]`（`timer_first_us` / `prefer_spin_below`） | `SleepMicroseconds` 内の switch（同名のローカル変数） |
 | `t_cfg` / `t_stat_*` / `t_timer`（TLS） | `[ThreadStatic]` フィールド群 |
-| `qpc_now_us()`（純整数の QPC 演算） | `InternalTiming.NowUs()`（NuGet は `NativeClock`、Unity は QPC） |
+| `qpc_now_us()`（純整数の QPC 演算） | `InternalTiming.NowUs()`（NuGet は `Stopwatch.GetTimestamp()`、Unity は QPC 直呼び） |
 | `spin_with_yield_until_us()` | `InternalTiming.SpinWithPeriodicYield()` |
 | `YieldProcessor()` | `SpinHints.HintOnce()` / `HintFewTimes()` |
 
 ## 構造上の非対称（混同しないこと）
 
 - **C++ 側にしか無い**：`DllMain` によるスレッド/プロセスデタッチ時のハンドル解放とタイマー分解能復帰、`usleep_query/init/shutdown_nt_resolution`（`NtSetTimerResolution` の公開 API 化）、`t_force_backend` テストフック、`probe_hrtimer_support()` のプロセス単位キャッシュ、C ABI・呼び出し規約・`.rc` バージョン整合。
-- **C# 側にしか無い**：`PreciseDelay` / `SpinCoreEngine` / `TimerWheel`（非同期・専用スピンスレッド）、`NativeClock` の `KUSER_SHARED_DATA` 直読み、3 ビルドバリアントの条件コンパイル。
+- **C# 側にしか無い**：`PreciseDelay` / `SpinCoreEngine` / `TimerWheel`（非同期・専用スピンスレッド）、3 ビルドバリアントの条件コンパイル。
 - **同じ概念だが実装が違う**：C++ は QPC を浮動小数点なしの商・剰余で計算する。C# の `NowUs()` は `_tickToUs`（double）を掛けている。数値挙動を比較する際はここを必ず考慮する。
 - C++ の `t_timer` は `DLL_THREAD_DETACH` でクローズされるが、**C# 側の `[ThreadStatic] _tTimer` はクローズされない**（スレッド終了時にリーク）。
 

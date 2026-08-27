@@ -2,6 +2,7 @@
 #if !USLP_UNITY
 
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
@@ -66,11 +67,25 @@ public static class PreciseDelay
         if (delay.Ticks <= 0)
             return ValueTask.CompletedTask;
 
-        // 5ms 超は WaitableTimer HR にフォールバック（省電力）
-        return delay.TotalMilliseconds > 5
+        // 閾値超は WaitableTimer HR にフォールバック（省電力）
+        return delay.TotalMilliseconds > SpinPathMaxMilliseconds
             ? new ValueTask(WaitableTimerAsync(delay, ct))
             : engine.EnqueueWait(delay, ct);
     }
+
+    /// <summary>
+    /// スピンスレッド（タイマーホイール）で処理する待機の上限（ms）。
+    /// これを超える待機は WaitableTimer HR へ回す。
+    /// </summary>
+    /// <remarks>
+    /// この値はタイマーホイールが表現できる範囲を超えてはならない。超えると
+    /// スロットが一周して deadline が過去のスロットに落ち、要求より早く完了する。
+    /// 実際に表現できる範囲は <see cref="Stopwatch.Frequency"/> に依存するため、
+    /// 検証は <see cref="SpinCoreEngine.Initialize"/> 経由で
+    /// <see cref="TimerWheel"/> のコンストラクタが実行時に行う
+    /// （<c>Debug.Assert</c> は Release ビルドで消えるので使わない）。
+    /// </remarks>
+    internal const int SpinPathMaxMilliseconds = 5;
 
     // ── WaitableTimer HR フォールバック ──────────────────────────
 

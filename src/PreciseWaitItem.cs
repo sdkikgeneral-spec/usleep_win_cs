@@ -34,6 +34,11 @@ internal sealed class PreciseWaitItem
 
     public ValueTask AsValueTask() => new(this, _vtsc.Version);
 
+    // 完了時にプールへ返してはならない。返した瞬間に別スレッドが Rent して
+    // Reset() を呼ぶと _vtsc.Version が変わり、まだ await していない
+    // 呼び出し元の ValueTask がトークン不一致で壊れる。
+    // 返却は GetResult（＝呼び出し元が結果を受け取り終えた時点）で行う。
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Complete()
     {
@@ -41,7 +46,6 @@ internal sealed class PreciseWaitItem
             "未初期化の PreciseWaitItem への Complete 呼び出し");
         IsInitialized = false;
         _vtsc.SetResult(true);
-        PreciseWaitItemPool.Return(this);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -51,11 +55,23 @@ internal sealed class PreciseWaitItem
             "未初期化の PreciseWaitItem への Cancel 呼び出し");
         IsInitialized = false;
         _vtsc.SetException(new OperationCanceledException());
-        PreciseWaitItemPool.Return(this);
     }
 
     // IValueTaskSource
-    public void GetResult(short token) => _vtsc.GetResult(token);
+    public void GetResult(short token)
+    {
+        try
+        {
+            _vtsc.GetResult(token);
+        }
+        finally
+        {
+            // await されずに捨てられた ValueTask はここを通らずプールに戻らないが、
+            // GC に回収されるだけで正しさは損なわれない。
+            PreciseWaitItemPool.Return(this);
+        }
+    }
+
     public ValueTaskSourceStatus GetStatus(short token) => _vtsc.GetStatus(token);
     public void OnCompleted(Action<object?> continuation, object? state,
         short token, ValueTaskSourceOnCompletedFlags flags)

@@ -36,7 +36,7 @@ dotnet add package usleep_win_cs
 ## 概要
 
 WaitableTimer HR + CPU ヒント命令（`PAUSE`/`YIELD`）+ 段階的スレッド譲渡を組み合わせたハイブリッド待機方式。
-NuGet ビルド（`net10.0-windows`）では `KUSER_SHARED_DATA` 直読み（NativeClock）による ~1 ns タイムスタンプを使用。Unity ビルドでは QPC を使用。
+時刻源は、NuGet ビルド（`net10.0-windows`）が `Stopwatch.GetTimestamp()`（内部で QPC）、Unity ビルドが QPC 直呼びです。
 
 > Windows はハードリアルタイム OS ではありません。精度は電源管理・仮想化・負荷の影響を受けます。
 
@@ -176,7 +176,7 @@ dotnet add package usleep_win_cs
 ## Overview
 
 Hybrid approach combining WaitableTimer HR + CPU hint instructions (`PAUSE`/`YIELD`) + staged cooperative yielding.
-NuGet builds (`net10.0-windows`) use `KUSER_SHARED_DATA` direct read (NativeClock) for ~1 ns timestamps; Unity builds use QPC.
+Timestamps come from `Stopwatch.GetTimestamp()` (QPC internally) in NuGet builds (`net10.0-windows`), and from a direct QPC call in Unity builds.
 
 > Windows is not a hard real-time OS. Accuracy is affected by power settings, virtualization, and background load.
 

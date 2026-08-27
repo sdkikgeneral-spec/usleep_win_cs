@@ -26,13 +26,13 @@ model: opus
 
 - **P/Invoke を追加するときは `NativeMethods.Partial.cs` の `#if USLP_GENERATOR`（`LibraryImport` + `partial`）と `#elif USLP_WINDOWS`（`DllImport`）の両方に、同一シグネチャで足す。** 片方だけは不可。
 - Unity 側にコンパイルされる範囲で **netstandard2.1 に無い API を使わない**（`ObjectDisposedException.ThrowIf` / `UInt128` / `Math.BigMul(ulong,ulong,out ulong)` / `ValueTask.CompletedTask` 等）。これらが必要なら `#if !USLP_UNITY` の内側に置く。
-- `PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem` / `NativeClock` は `#if !USLP_UNITY` で丸ごと除外される。除外されないファイルからこれらを参照する場合は必ずガードで囲む。
+- `PreciseDelay` / `SpinCoreEngine` / `TimerWheel` / `PreciseWaitItem` は `#if !USLP_UNITY` で丸ごと除外される。除外されないファイルからこれらを参照する場合は必ずガードで囲む。
 
 ### 壊してはいけない不変条件
 - `UsleepWin` の設定・統計はすべて `[ThreadStatic]`。プロセス共有に変える提案は破壊的変更なので、指示が無ければやらない。
-- `SpinCoreEngine.SpinLoop` の**ループ内で P/Invoke を呼ばない**。アフィニティ・優先度・`NtSetTimerResolution` は起動時 1 回だけ。時刻は `NativeClock.GetTimestamp()`。
+- `SpinCoreEngine.SpinLoop` の**ループ内で P/Invoke を呼ばない**。アフィニティ・優先度・`NtSetTimerResolution` は起動時 1 回だけ。時刻は `Stopwatch.GetTimestamp()`。
 - `PreciseWaitItem.Complete()` / `CompleteAsCancelled()` は**スピンスレッド単独**で呼ばれる前提で `Interlocked` を使っていない。この前提を崩す変更をしない。
-- `NativeClock` の `KUSER_SHARED_DATA` オフセット（`0x3B8` / `0x3C4`）と信頼性検証・フォールバック経路を、根拠なく変更しない。
+- 時刻源は `Stopwatch.GetTimestamp()`。かつて `KUSER_SHARED_DATA`（`0x7FFE0000`）直読みの `NativeClock` があったが、読んでいた QpcBias は単調増加カウンタでなく（実測で 50ms 後も差分 0）、shift として読んでいた `0x3C4` は ActiveGroupCount だったため撤去した。**直読みを復活させないこと。**
 - 公開メンバーには **XML doc コメントを必ず付ける**（`GenerateDocumentationFile` が有効なため、無いと警告になる）。
 
 ## 検証（実装しただけで終わらせない）

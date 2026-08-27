@@ -44,7 +44,9 @@ internal sealed class SpinCoreEngine : IDisposable
             throw new SecurityException(
                 "RealTime優先度クラスでの実行は禁止されています");
 
-        _wheel   = new TimerWheel();
+        // スピン経路で受け付ける最大待機をホイールが表現できることを実行時に検証する
+        // （表現範囲は Stopwatch.Frequency に依存するため定数比較では担保できない）。
+        _wheel   = new TimerWheel(PreciseDelay.SpinPathMaxMilliseconds * 1000L);
         _running = true;
 
         _spinThread = new Thread(SpinLoop)
@@ -60,7 +62,7 @@ internal sealed class SpinCoreEngine : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, nameof(SpinCoreEngine));
         var  item     = PreciseWaitItemPool.Rent(ct);
-        long deadline = NativeClock.GetTimestamp()
+        long deadline = Stopwatch.GetTimestamp()
                         + (long)(delay.TotalSeconds * Stopwatch.Frequency);
         _incoming.Enqueue((item, deadline));
         return item.AsValueTask();
@@ -80,11 +82,18 @@ internal sealed class SpinCoreEngine : IDisposable
 
         while (_running)
         {
-            long now = NativeClock.GetTimestamp(); // ~1ns、P/Invokeゼロ
-            wheel.Advance(now);                    // O(1)
+            wheel.Advance(Stopwatch.GetTimestamp()); // 内部で QPC（実測 ~20 ns/call）
 
             while (_incoming.TryDequeue(out var req))
+            {
+                // drain の途中でも _currentSlot を最新に保つ。ここを省くと、
+                // Advance からの経過時間ぶんだけ「何スロット先か」の判定が
+                // ずれ、バーストや直前のプリエンプトでホイール範囲外と
+                // 誤判定されうる。Advance は進んだスロットぶんしか回らないので
+                // 通常はほぼ空振りで返る。
+                wheel.Advance(Stopwatch.GetTimestamp());
                 wheel.Enqueue(req.Item, req.Deadline);
+            }
 
             if (_incoming.IsEmpty)
                 Thread.SpinWait(50);
@@ -96,8 +105,15 @@ internal sealed class SpinCoreEngine : IDisposable
         if (_disposed) return;
         _disposed = true;
         _running  = false;
-        _spinThread?.Join(TimeSpan.FromSeconds(1));
-        _wheel?.Dispose();
+
+        // Join が成功したときだけ Dispose する。まだスピンスレッドが動いている
+        // 状態で _disposed を立てた TimerWheel を触らせると、次の Enqueue が
+        // ObjectDisposedException を投げてスピンスレッドごとプロセスが落ちる。
+        // 取りこぼした場合はホイールを解放せず GC に委ねる。
+        bool stopped = _spinThread?.Join(TimeSpan.FromSeconds(1)) ?? true;
+        if (stopped)
+            _wheel?.Dispose();
+
         _wheel      = null;
         _spinThread = null;
     }

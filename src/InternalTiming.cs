@@ -23,7 +23,7 @@ internal static class InternalTiming
     private static long InitQpc()
     {
 #if USLP_WINDOWS
-        // USLP_GENERATOR は NativeClock を使うため QPC 周波数は不要
+        // USLP_GENERATOR は Stopwatch 経路を使うため QPC 周波数は参照されない
         if (_isWin && QueryPerformanceFrequency(out var f)) return f.QuadPart;
 #endif
         return 0;
@@ -35,10 +35,16 @@ internal static class InternalTiming
     internal static ulong NowUs()
     {
 #if USLP_GENERATOR
-        // NativeClock: KUSER_SHARED_DATA直読み (~1ns、P/Invokeゼロ)。
-        // 信頼性検証済み。非対応環境では内部で Stopwatch にフォールバック済み。
+        // Stopwatch.GetTimestamp() は内部で QPC を呼ぶ（実測 ~20 ns/call）。
+        //
+        // 以前はここで KUSER_SHARED_DATA(0x7FFE0000) の直読みを試み「~1 ns」と
+        // 称していたが、読んでいた 0x3B8 は QpcBias で単調増加するカウンタではなく
+        // （実測: 50 ms 経過しても差分 0）、shift として読んでいた 0x3C4 は
+        // ActiveGroupCount だった（QpcShift は 0x3C7）。結果として起動時の
+        // 信頼性検証が常に失敗し、実際には毎回この Stopwatch 経路へ
+        // フォールバックしていた。直読みは撤去した。
         if (_hires)
-            return (ulong)(Usleep.Win.NativeClock.GetTimestamp() * _tickToUs);
+            return (ulong)(Stopwatch.GetTimestamp() * _tickToUs);
 #elif USLP_WINDOWS
         if (_isWin && _qpcFreq > 0 && QueryPerformanceCounter(out var c))
             return (ulong)((c.QuadPart * 1_000_000L) / _qpcFreq);
