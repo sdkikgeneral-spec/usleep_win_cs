@@ -53,7 +53,7 @@ Compile-time constants select the implementation appropriate for each target env
 | `USLP_WINDOWS` | Unity Windows-only DLL | Uses `DllImport` + `SuppressUnmanagedCodeSecurity` |
 | `USLP_X64_ONLY` | NuGet x64-only build (optional) | Calls `X86Base.Pause()` directly without runtime branching |
 | `USLP_NUGET` | NuGet build identifier | Currently used alongside `USLP_GENERATOR`; reserved for future conditional use |
-| `USLP_UNITY` | Unity DLL (both variants) | Excludes the 5 `PreciseDelay`-related files from compilation (`#if !USLP_UNITY`) |
+| `USLP_UNITY` | Unity DLL (both variants) | Excludes the 4 `PreciseDelay`-related files from compilation (`#if !USLP_UNITY`) |
 
 **Generic build (neither constant defined):**  
 All Win32 API calls are excluded at compile time. `Platform.IsWindows` always returns `false`, so WaitableTimer, QPC, and Sleep APIs are never called. The implementation falls back to `Thread.Yield()` / `Thread.Sleep()` / `Stopwatch`.
@@ -88,7 +88,7 @@ Uses the source generator approach available since .NET 7. Marshalling code is g
   The actual entry points are `CreateWaitableTimerExW` and `SetWaitableTimer` respectively (declared via the `EntryPoint` attribute).
 
 - **`SetThreadInformation`**
-  Passes `THREAD_POWER_THROTTLING_STATE` by `ref` to configure thread power throttling.
+  Passes `THREAD_POWER_THROTTLING_STATE` by `ref` to configure thread power throttling. See 3.4 for details.
 
 ### 3.2 Unity Windows Build: `DllImport` (`USLP_WINDOWS`)
 
@@ -97,6 +97,36 @@ Uses the classic `DllImport` approach with `[SuppressUnmanagedCodeSecurity]` to 
 ### 3.3 Unity Generic Build
 
 No P/Invoke. All Win32 branches are excluded from compilation.
+
+### 3.4 `SetPowerMode(UsleepPowerMode)` Implementation
+
+The `ThreadPowerThrottling` value of `THREAD_INFORMATION_CLASS` is enum value **3**
+(the `ThreadPowerThrottling` constant in `src/Interop/NativeMethods.Partial.cs`).
+
+> This constant was previously (incorrectly) set to `11`, which caused
+> `SetThreadInformation` to fail with `ERROR_INVALID_PARAMETER`, so `SetPowerMode`
+> always returned `false` regardless of the requested mode. The upstream C++
+> implementation had already fixed the same bug separately; the fix had not been
+> ported to the C# side.
+
+Out-of-range `enum` values are rejected via `Enum.IsDefined(typeof(UsleepPowerMode), mode)`
+and return `false` immediately. On non-Windows builds this always returns `false`.
+
+`THREAD_POWER_THROTTLING_STATE`'s `ControlMask` (which throttling categories the caller
+controls) and `StateMask` (whether to enable them) are set per mode as follows:
+
+| Mode | `ControlMask` | `StateMask` | Behavior |
+|---|---|---|---|
+| `ECO` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | Enable execution-speed throttling under caller control |
+| `PERF` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | `0` | Take control, but keep throttling disabled (performance-preferred) |
+| `DEFAULT` | `0` | `0` | Release caller control and restore OS default behavior |
+
+> `DEFAULT` previously left `ControlMask` set, so it never actually restored the OS
+> default and behaved identically to `PERF`. The three modes are now clearly
+> distinguished.
+
+**Applies only to the calling thread.** It has no effect on the `PreciseDelay` spin
+thread (`SpinCoreEngine`) or any other thread.
 
 ---
 
@@ -109,10 +139,9 @@ No P/Invoke. All Win32 branches are excluded from compilation.
 ```
 [USLP_GENERATOR — NuGet build]
 
-1. NativeClock path (Stopwatch.IsHighResolution == true)
-   NativeClock.GetTimestamp() * _tickToUs
-   ※ KUSER_SHARED_DATA direct read (~1 ns). Falls back to Stopwatch internally
-     on unsupported systems.
+1. Stopwatch path (Stopwatch.IsHighResolution == true)
+   Stopwatch.GetTimestamp() * _tickToUs
+   ※ Stopwatch.GetTimestamp() internally calls QPC (measured ~20 ns/call)
 
 2. TickCount fallback (Stopwatch.IsHighResolution == false)
    (ulong)(uint)Environment.TickCount * 1000UL
@@ -128,14 +157,32 @@ No P/Invoke. All Win32 branches are excluded from compilation.
 
 3. TickCount fallback (Stopwatch.IsHighResolution == false)
    (ulong)(uint)Environment.TickCount * 1000UL
+
+[Neither constant defined — Generic build]
+
+Same as steps 2–3 of the USLP_WINDOWS block above (Stopwatch path → TickCount fallback).
 ```
+
+> An earlier version used a `NativeClock` class that read `KUSER_SHARED_DATA`
+> (`0x7FFE0000`) directly as the preferred path in NuGet builds. It has been removed
+> (`src/NativeClock.cs` no longer exists). Measurement showed the offset `0x3B8` it
+> read as a "monotonically increasing counter" (intended as `QpcBias`) had a delta of
+> 0 even after 50 ms had elapsed, and the offset `0x3C4` read as the shift value was
+> actually `ActiveGroupCount`, not the real `QpcShift` (`0x3C7`). As a result, the
+> startup reliability check always failed and the code fell back to
+> `Stopwatch.GetTimestamp()` on every call anyway. The reliability check itself relied
+> on `Interlocked.MemoryBarrierProcessWide()`, measured at 88 ns/call — slower than
+> `Stopwatch.GetTimestamp()`'s measured 19.7 ns/call — so the "~1 ns, zero P/Invoke"
+> premise never held.
 
 ### Accuracy Notes
 
-- NativeClock (NuGet): equivalent accuracy to QPC (±1 µs or better) with zero P/Invoke overhead (~1 ns).
 - QPC (Unity Windows): typically ±1 µs or better. Frequency is cached in `_qpcFreq` at startup.
-- Stopwatch (high-resolution): equivalent to QPC (most environments use QPC internally).
-- TickCount fallback: 1 ms granularity; used only on non-Windows or non-high-resolution systems.
+- Stopwatch (high-resolution, the only path used in NuGet builds): equivalent to QPC (most environments use QPC internally; measured ~20 ns/call).
+- TickCount fallback: 1 ms granularity; used only when `Stopwatch.IsHighResolution == false`.
+
+None of these paths provide any accuracy guarantee. Windows is not a hard real-time
+OS; measured results vary with scheduler, power management, and virtualization.
 
 ---
 
@@ -431,7 +478,8 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 - **Internal exception handling**: `EntryPointNotFoundException` is caught inside `GetTimer()` and does not propagate to callers.
 - **No cross-thread handle sharing**: `[ThreadStatic]` ensures each thread owns its timer handle exclusively.
 - **Timer resolution double-call prevention**: `_timerResolutionLock` serializes `timeBeginPeriod` calls, preventing race conditions.
-- **Integer overflow in `NowUs()` (Unity / `USLP_WINDOWS`)**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice. In NuGet builds, `NativeClock.GetTimestamp() * _tickToUs` (floating-point multiplication) is used instead, so integer overflow does not apply.
+- **Integer overflow in `NowUs()` (Unity / `USLP_WINDOWS`)**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice. In NuGet builds (`USLP_GENERATOR`), `Stopwatch.GetTimestamp() * _tickToUs` (floating-point multiplication) is used instead, so integer overflow likewise does not apply.
+- **Internal visibility for tests**: In `USLP_GENERATOR` builds only, `src/AssemblyAttributes.cs` declares `[assembly: InternalsVisibleTo("UsleepWin.Tests")]`. `TimerWheel` and `PreciseWaitItem` remain `internal`, but boundary conditions (large bursts of past deadlines, deadlines beyond the wheel's representable range) cannot be reproduced through integration tests that go through `PreciseDelay`, so the test assembly is given direct access. This does not affect the visibility of any public API.
 
 ---
 
@@ -444,51 +492,122 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 `PreciseDelay` is a static class that provides **±1–3 µs** precision async waits — beyond what `UsleepWin` can achieve.
 A dedicated spin thread, timer wheel, and `IValueTaskSource` pool combine to deliver **zero-allocation** high-precision scheduling.
 
-NuGet target (`net10.0-windows`) only. All five source files are excluded from Unity DLL builds via `#if !USLP_UNITY`.
+NuGet target (`net10.0-windows`) only. All four source files are excluded from Unity DLL builds via `#if !USLP_UNITY`.
 
 ### 14.2 Class Overview
 
 | Class / File | Role |
 | --- | --- |
-| `NativeClock` (`src/NativeClock.cs`) | ~1 ns timestamp by direct read of `KUSER_SHARED_DATA` (address `0x7FFE0000`). Zero P/Invoke hot path. Falls back to `Stopwatch.GetTimestamp()` if the value is unreliable or OS < Win10 1803. |
 | `PreciseWaitItem` (`src/PreciseWaitItem.cs`) | Wait item using `IValueTaskSource` + `ObjectPool<T>`. Issues zero-allocation `ValueTask` via `ManualResetValueTaskSourceCore<bool>`. |
-| `TimerWheel` (`src/TimerWheel.cs`) | 4096-slot timer wheel. O(1) slot calculation via `Math.BigMul` magic-number division. |
+| `TimerWheel` (`src/TimerWheel.cs`) | 8192-slot timer wheel. O(1) slot calculation via plain `long` division. |
 | `SpinCoreEngine` (`src/SpinCoreEngine.cs`) | Spin thread pinned to a dedicated CPU core. Minimizes system timer resolution with `NtSetTimerResolution(1)` and calls `TimerWheel.Advance()` in a tight loop. |
 | `PreciseDelay` (`src/PreciseDelay.cs`) | Public API. Automatically routes to the spin path (≤5 ms) or WaitableTimer HR path (>5 ms). |
 
-### 14.3 NativeClock Implementation
+The time source is `Stopwatch.GetTimestamp()`. An earlier version had a separate
+`NativeClock` class (`src/NativeClock.cs`) that read `KUSER_SHARED_DATA` directly;
+it has been removed. See section 4 ("Timestamp Acquisition") for the reasoning.
 
-Reads offset `0x320` (`InterruptTime`) of the `KUSER_SHARED_DATA` structure directly via an `unsafe` pointer.
-Because a 64-bit value spans two 32-bit reads, it uses a tearing-read pattern — High → Low → High — retrying until the two High reads agree.
+### 14.3 When `PreciseWaitItem` Is Returned to the Pool
 
-```text
-address = (byte*)0x7FFE0000 + 0x320
-loop:
-    hi1 = *(uint*)(address + 4)
-    lo  = *(uint*)(address)
-    hi2 = *(uint*)(address + 4)
-    if hi1 == hi2: return (long)((ulong)hi1 << 32 | lo)
+The item is **not** returned to the pool at the moment `Complete()` /
+`CompleteAsCancelled()` runs. It is returned in `GetResult()` instead — i.e. once the
+caller has received the result via `await`.
+
+```csharp
+public void GetResult(short token)
+{
+    try { _vtsc.GetResult(token); }
+    finally { PreciseWaitItemPool.Return(this); }
+}
 ```
 
-The value is in 100-ns units. It is scaled by a `Stopwatch.Frequency`-based coefficient to match the units of `Stopwatch.GetTimestamp()`.
+**Reason:** If the item were returned at completion time (`Complete()`), another
+thread could `Rent()` and `Reset()` the same instance before the original caller had
+awaited it. `Reset()` calls `ManualResetValueTaskSourceCore<bool>.Reset()`, which
+changes `_vtsc.Version`, so the not-yet-awaited `ValueTask` — which still holds the
+old token — would break. Deferring the return to `GetResult()` guarantees the
+instance is only reused once the caller has fully consumed the result.
+
+`Complete()` / `CompleteAsCancelled()` are designed to be called only from `SpinLoop`
+(the spin thread, single-threaded); no `Interlocked` operations are used. The
+`IsInitialized` flag guards against use-after-free.
 
 ### 14.4 TimerWheel Design
 
-#### Slot Calculation (O(1) Magic-Number Division)
+#### Slot Calculation (Plain `long` Division)
 
-`ticksPerSlot = Stopwatch.Frequency / 1_000_000` (ticks per µs) is computed at construction time. `ComputeMagicNumbers()` derives the corresponding magic multiplier.
+`_ticksPerSlot = Stopwatch.Frequency / 1_000_000` (ticks per µs) is computed at
+construction time, and the slot number is simply `diff / _ticksPerSlot`.
 
 ```text
-slot = (diff × magicMultiplier) >> (magicShift - 64)  [upper 64 bits]
-     & SlotMask
+diff = timestamp - _baseTimestamp   (_baseTimestamp is fixed at construction)
+slot = diff / _ticksPerSlot
 ```
 
-`diff = timestamp - _baseTimestamp` (`_baseTimestamp` is fixed at construction).
-At a QPC frequency of ~10 MHz, overflow requires **~29,000 years** — not a practical concern.
+`diff` does not overflow `long` for roughly **~29,000 years** at a QPC frequency of
+~10 MHz — not a practical concern.
 
-#### Why `ResetBase()` Was Removed
+> **Why the magic-number division (`Math.BigMul`) was removed**
+>
+> An earlier version avoided division by computing a magic multiplier — the
+> reciprocal of `_ticksPerSlot` — via `ComputeMagicNumbers()` and using
+> `(diff × magicMultiplier) >> (magicShift - 64)`. However the formula
+> `2^(64+log2(d)+1) / d` overflows `ulong` (max `1.84 × 10^19`) when `d = 10`
+> (10 ticks per µs; `Stopwatch.Frequency = 10 MHz` is the most common value on
+> Windows, not an exotic configuration), producing `2.95 × 10^19`; only the lower
+> 64 bits survived. The effective factor became `0.0375` rather than `1/10 = 0.1`,
+> so each "slot" was actually about **2.67 µs** instead of 1 µs.
+>
+> The wheel's effective range therefore did not shrink — it grew by roughly 2.67×
+> (about 10.9 ms for 4096 slots). The real defect was not early completion from
+> insufficient range but that **wait granularity was quantized to 2.67 µs, so the
+> ±1–3 µs target of `PreciseDelay` could not hold**. A plain `long`
+> division costs only a few nanoseconds per call, not dominant compared to a single
+> spin-loop iteration (which includes a `Stopwatch.GetTimestamp()` call, measured
+> ~20 ns), so correctness was prioritized over the magic-number trick.
 
-An early version of the spec included a `ResetBase()` method that reset `_baseTimestamp`. This caused a bug: already-queued items had slot indices computed against the old base, so after a reset they could fire up to ~4 ms late. Making `_baseTimestamp` `readonly` and setting it only once at construction eliminates the problem at its root.
+#### Runtime Span Validation in the Constructor
+
+The `TimerWheel` constructor takes `requiredSpanMicroseconds` — the maximum wait
+duration (µs) the wheel must be able to represent. Because the actual representable
+range depends on `Stopwatch.Frequency` (`_ticksPerSlot` is computed via truncating
+division, so on environments where the frequency is not a multiple of 1 MHz, a
+single slot can be less than 1 µs), the constructor computes
+`spanUs = SlotCount * _ticksPerSlot * 1_000_000 / Stopwatch.Frequency` and throws
+`NotSupportedException` if it falls short of `requiredSpanMicroseconds`.
+`Debug.Assert` is deliberately not used (it is stripped in Release builds, and a
+failed assert terminates the .NET process immediately).
+
+`SpinCoreEngine.Initialize()` performs this validation by passing
+`PreciseDelay.SpinPathMaxMilliseconds` (5 ms).
+
+#### Absolute Slot Number, `Advance()`, and `Enqueue()`
+
+`_currentSlot` is kept as an absolute, non-wrapping slot number (the masked value
+alone cannot determine ordering). `Advance()` walks forward one slot at a time up to
+the slot corresponding to the current time. If more than a full lap has elapsed
+(e.g. right after the spin thread starts, or after being preempted), it sweeps all
+slots once to catch up instead of looping slot-by-slot.
+
+If `Enqueue()` is called with a deadline at or before the current slot (i.e. already
+past due), the item is completed on the spot via `Complete()` /
+`CompleteAsCancelled()` instead of being queued. It deliberately does *not* place
+such items into the current slot: a burst of past-due items arriving together would
+concentrate into a single slot and exceed `MaxSlotCapacity` (1024), causing
+`GrowSlot()` to throw and taking down the spin thread (and the process) with it.
+`Complete()` is contractually only called from the spin thread, and since
+`Enqueue()`'s only caller is `SpinLoop`, that contract is preserved.
+
+If a deadline exceeds the wheel's representable range (`SlotCount` slots), it is
+clamped to the farthest representable slot rather than wrapping around into a past
+slot (which would complete early). `SpinLoop` calls `Advance()` even mid-drain of
+`_incoming` to keep `_currentSlot` current, so this branch is normally not reached.
+
+#### Dispose
+
+`TimerWheel.Dispose()` merely sets the `_disposed` flag. The caller
+(`SpinCoreEngine`) only invokes it once the spin thread's `Thread.Join()` has
+succeeded (see 14.6).
 
 ### 14.5 WaitAsync Routing
 
@@ -513,17 +632,24 @@ On the WaitableTimer HR path, `ThreadPool.RegisterWaitForSingleObject` is used. 
 
 Inside `Initialize()`, a temporary variable is used for the `SpinCoreEngine` instance; it is assigned to `_engine` only after `Initialize()` succeeds. This prevents `IsInitialized` from being `true` after a failed initialization.
 
+`SpinCoreEngine.Dispose()` sets `_running = false` and then calls
+`TimerWheel.Dispose()` **only if** `Thread.Join(TimeSpan.FromSeconds(1))` on the spin
+thread succeeds. If a live spin thread were allowed to touch a `TimerWheel` whose
+`_disposed` flag had already been set, the next `Enqueue()` would throw
+`ObjectDisposedException` and take the spin thread (and the process) down with it.
+If `Join` times out, the wheel is left for the GC instead of being disposed.
+
 ### 14.7 Related Files
 
 | File | Content |
 | --- | --- |
-| [src/NativeClock.cs](../src/NativeClock.cs) | KUSER_SHARED_DATA direct-read timestamp |
 | [src/PreciseWaitItem.cs](../src/PreciseWaitItem.cs) | IValueTaskSource + ObjectPool wait item |
-| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) magic-number division timer wheel |
+| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) timer wheel (8192 slots, plain `long` division) |
 | [src/SpinCoreEngine.cs](../src/SpinCoreEngine.cs) | Dedicated-core spin thread engine |
 | [src/PreciseDelay.cs](../src/PreciseDelay.cs) | Public API (Initialize / Shutdown / WaitAsync) |
-| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | All 18 tests |
-| [document/test_result.md](test_result.md) | Test result report (all 33 passed) |
+| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | Integration tests for `PreciseDelay`, plus direct `TimerWheel` boundary-condition tests (via `InternalsVisibleTo`) |
+| [tests/UsleepWin.UnityWindows.Tests](../tests/UsleepWin.UnityWindows.Tests) | Smoke tests for the Unity Windows variant (`USLP_UNITY` + `USLP_WINDOWS`), exercising the `DllImport` P/Invoke and QPC paths at run time. This runs on CoreCLR and is not a validation of Mono / IL2CPP |
+| [document/test_result.md](test_result.md) | Test result report (snapshot from initial run; see the test project for the current test count) |
 
 ---
 

@@ -23,7 +23,10 @@ internal static class InternalTiming
     private static long InitQpc()
     {
 #if USLP_WINDOWS
-        // USLP_GENERATOR は Stopwatch 経路を使うため QPC 周波数は参照されない
+        // NuGet ビルドは USLP_WINDOWS と USLP_GENERATOR を同時に定義するため、
+        // ここは NuGet でも実行される（QueryPerformanceFrequency を 1 回呼ぶ）。
+        // ただし NowUs() は USLP_GENERATOR 側の Stopwatch 経路を通るので、
+        // 得られた _qpcFreq が読まれるのは Unity Windows ビルドのときだけ。
         if (_isWin && QueryPerformanceFrequency(out var f)) return f.QuadPart;
 #endif
         return 0;

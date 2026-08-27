@@ -134,3 +134,37 @@ Unity ビルド（`USLP_WINDOWS`）は従来通り QPC を使用。
 | [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | PreciseDelay 新 API テスト |
 | [tests/UsleepWin.Tests/TestCollections.cs](../tests/UsleepWin.Tests/TestCollections.cs) | xUnit コレクション定義（直列化） |
 | [tests/UsleepWin.Tests/UsleepWin.Tests.csproj](../tests/UsleepWin.Tests/UsleepWin.Tests.csproj) | テストプロジェクト定義 |
+
+---
+
+## 追記（2026-08-27, コミット `ad6a1d9` 以降）
+
+上記「アーキテクチャ改善（NativeClock 統合・P/Invoke 整理）」節の**改善1**は、その後の
+実測により前提が誤っていたことが判明し、撤回された。`NativeClock`（`KUSER_SHARED_DATA`
+直読み）は削除済みで、`InternalTiming.NowUs()`（NuGet ビルド）は `Stopwatch.GetTimestamp()`
+に統一されている。詳細な経緯は [document/specsheet.md](specsheet.md) 第 4 章を参照。
+
+このコミットでは他に、`TimerWheel` のスロット計算（Magic Number 除算の桁溢れ修正）、
+`PreciseWaitItem` のプール返却タイミング、`SetPowerMode` の `ThreadPowerThrottling` 定数
+修正なども行われた。`ad6a1d9` の時点で `UsleepWin.Tests` は 33 件から 44 件に増加している
+（詳細は [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs)
+と [tests/UsleepWin.Tests/UsleepWinTests.cs](../tests/UsleepWin.Tests/UsleepWinTests.cs) を
+参照）。上記の本文（実施日 2026-03-11 時点の記録）はそのまま残し、本追記のみで最新状態を
+示す。
+
+### テストプロジェクトの 2 分割（`ad6a1d9` の後続変更）
+
+`build_unity_windows.bat` の不具合（バッチ内の `%3B` がバッチ引数として展開され、定数が
+`USLP_UNITYBUSLP_WINDOWS` に化けていた）により、Unity Windows バリアントは長らくビルドすら
+通っておらず、`DllImport` 版の P/Invoke と QPC 経路は一度も実行されたことがなかった。
+そのため [tests/UsleepWin.UnityWindows.Tests](../tests/UsleepWin.UnityWindows.Tests) を新設し、
+`USLP_UNITY` + `USLP_WINDOWS` で `src` を直接コンパイルするスモークテスト 13 件を追加した。
+
+| プロジェクト | 検証対象 | 件数 |
+|---|---|---|
+| [tests/UsleepWin.Tests](../tests/UsleepWin.Tests) | NuGet バリアント（`USLP_GENERATOR` 系） | 44 |
+| [tests/UsleepWin.UnityWindows.Tests](../tests/UsleepWin.UnityWindows.Tests) | Unity Windows バリアント（`DllImport` + QPC 経路） | 13 |
+
+後者は **CoreCLR 上での `DllImport` 検証であり、Unity の Mono / IL2CPP の検証ではない**。
+netstandard2.1 での API 存在確認と `build_unity_windows.bat` 自体の正しさは
+`build_all.bat` が担保する。

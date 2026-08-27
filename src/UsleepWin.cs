@@ -14,8 +14,13 @@ namespace Usleep.Win
         [ThreadStatic] private static UsleepProfile _profile = UsleepProfile.BALANCED;
         [ThreadStatic] private static uint _tailSpinUs = 250;
         [ThreadStatic] private static UsleepYieldPolicy _yieldPolicy = UsleepYieldPolicy.SLEEP0;
+#if USLP_WINDOWS || USLP_GENERATOR
+        // タイマー分解能はプロセス全体の設定なので、スレッドローカルにしない。
+        // Win32 を呼ばないバリアント（Unity Generic）では参照されないため、
+        // CS0169（未使用フィールド）を避けて宣言ごと除外する。
         private static readonly object _timerResolutionLock = new object();
         private static uint _timerResolutionMs;
+#endif
 
 #if USLP_GENERATOR
     /// <summary>

@@ -53,7 +53,7 @@
 | `USLP_WINDOWS` | Unity Windows-only DLL | `DllImport` + `SuppressUnmanagedCodeSecurity` を使用 |
 | `USLP_X64_ONLY` | NuGet x64 専用ビルド（オプション） | `X86Base.Pause()` を実行時分岐なしで直接呼び出す |
 | `USLP_NUGET` | NuGet ビルド識別子 | 現状は `USLP_GENERATOR` と併用。将来の条件分岐用 |
-| `USLP_UNITY` | Unity DLL（両バリアント） | `PreciseDelay` 関連の5ファイルをコンパイルから除外する（`#if !USLP_UNITY`） |
+| `USLP_UNITY` | Unity DLL（両バリアント） | `PreciseDelay` 関連の4ファイルをコンパイルから除外する（`#if !USLP_UNITY`） |
 
 **Generic ビルド（どちらも未定義）:**  
 すべての Win32 API 呼び出しがコンパイルから除外される。`Platform.IsWindows` は常に `false` を返すため、WaitableTimer・QPC・Sleep 系 API は一切呼ばれず、`Thread.Yield()` / `Thread.Sleep()` / `Stopwatch` ベースのフォールバック実装になる。
@@ -88,7 +88,7 @@
   エントリポイントはそれぞれ `CreateWaitableTimerExW` / `SetWaitableTimer` と同一（`EntryPoint` 属性で明示）。
 
 - **`SetThreadInformation`**
-  `THREAD_POWER_THROTTLING_STATE` 構造体を `ref` で渡す。スレッド電力スロットリングの設定に使用。
+  `THREAD_POWER_THROTTLING_STATE` 構造体を `ref` で渡す。スレッド電力スロットリングの設定に使用。詳細は 3.4 節。
 
 ### 3.2 Unity Windows ビルド：`DllImport`（`USLP_WINDOWS`）
 
@@ -97,6 +97,33 @@
 ### 3.3 Unity Generic ビルド
 
 P/Invoke なし。Win32 分岐はすべてコンパイル除外。
+
+### 3.4 `SetPowerMode(UsleepPowerMode)` の実装
+
+`THREAD_INFORMATION_CLASS` の `ThreadPowerThrottling` は列挙値 **3** である
+（`src/Interop/NativeMethods.Partial.cs` の `ThreadPowerThrottling` 定数）。
+
+> 過去にこの定数を誤って `11` としていた時期があり、`SetThreadInformation` が
+> `ERROR_INVALID_PARAMETER` で失敗し、`SetPowerMode` は指定モードによらず常に `false`
+> を返していた。C++ 版移植元では別途修正済みだったが C# 側への移植が漏れていた。
+
+範囲外の `enum` 値は `Enum.IsDefined(typeof(UsleepPowerMode), mode)` で弾き、即 `false` を
+返す。Windows 以外のビルドでは常に `false`。
+
+`THREAD_POWER_THROTTLING_STATE` の `ControlMask`（どのスロットリングを自前で制御するか）と
+`StateMask`（それを有効にするか）を、モードごとに次のように設定する。
+
+| モード | `ControlMask` | `StateMask` | 挙動 |
+|---|---|---|---|
+| `ECO` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | 実行速度スロットリングを自前で有効化 |
+| `PERF` | `THREAD_POWER_THROTTLING_EXECUTION_SPEED` | `0` | 自前で制御し、スロットリングは無効化（性能優先） |
+| `DEFAULT` | `0` | `0` | 自前制御を解除し OS 既定の挙動に戻す |
+
+> 以前は `DEFAULT` でも `ControlMask` を立てたままにしていたため、OS 既定へ戻らず
+> `PERF` と同じ扱いになっていた。3 モードを明確に区別する分岐へ修正済み。
+
+**適用範囲は呼び出しスレッドのみ。** `PreciseDelay` のスピンスレッド（`SpinCoreEngine`）や
+他のスレッドには一切影響しない。
 
 ---
 
@@ -109,9 +136,9 @@ P/Invoke なし。Win32 分岐はすべてコンパイル除外。
 ```
 【USLP_GENERATOR（NuGet ビルド）】
 
-1. NativeClock パス（Stopwatch.IsHighResolution == true）
-   NativeClock.GetTimestamp() * _tickToUs
-   ※ KUSER_SHARED_DATA 直読み（~1 ns）。非対応環境では内部で Stopwatch にフォールバック済み
+1. Stopwatch パス（Stopwatch.IsHighResolution == true）
+   Stopwatch.GetTimestamp() * _tickToUs
+   ※ Stopwatch.GetTimestamp() は内部で QPC を呼ぶ（実測 ~20 ns/call）
 
 2. TickCount フォールバック（Stopwatch.IsHighResolution == false）
    (ulong)(uint)Environment.TickCount * 1000UL
@@ -127,14 +154,30 @@ P/Invoke なし。Win32 分岐はすべてコンパイル除外。
 
 3. TickCount フォールバック（Stopwatch.IsHighResolution == false）
    (ulong)(uint)Environment.TickCount * 1000UL
+
+【いずれの定数も未定義（Generic ビルド）】
+
+上記 USLP_WINDOWS ブロックの 2〜3（Stopwatch パス→TickCount フォールバック）と同じ。
 ```
+
+> 以前は NuGet ビルドで `KUSER_SHARED_DATA`（`0x7FFE0000`）を直接読む `NativeClock` を
+> 優先経路として使っていたが撤去した（`src/NativeClock.cs` は削除済み）。実測したところ
+> `NativeClock` が「単調増加するカウンタ」として読んでいたオフセット `0x3B8`
+> （QpcBias のつもり）は 50 ms 経過しても差分が 0 で、shift として読んでいた `0x3C4` は
+> `ActiveGroupCount` であって本来の `QpcShift`（`0x3C7`）ではなかった。このため起動時の
+> 信頼性検証が常に失敗し、実際には毎回 `Stopwatch.GetTimestamp()` へフォールバックして
+> いた。検証に使っていた `Interlocked.MemoryBarrierProcessWide()` 自体も実測 88 ns/call と
+> `Stopwatch.GetTimestamp()` の実測 19.7 ns/call より遅く、「~1 ns・P/Invoke ゼロ」という
+> 前提が成立していなかった。
 
 ### 精度
 
-- NativeClock（NuGet）：QPC と同等の精度（±1 µs 以下）かつ P/Invoke ゼロ（~1 ns オーバーヘッド）
 - QPC（Unity Windows）：通常 ±1 µs 以下。周波数は起動時に `_qpcFreq` へキャッシュ
-- Stopwatch（高分解能）：QPC と同等（内部的に QPC を使用する環境が多い）
-- TickCount フォールバック：1 ms 粒度（非 Windows 環境でのみ使用）
+- Stopwatch（高分解能、NuGet ビルドはこちらのみ）：QPC と同等（内部的に QPC を使用する環境が多い。実測 ~20 ns/call）
+- TickCount フォールバック：1 ms 粒度（`Stopwatch.IsHighResolution == false` の環境でのみ使用）
+
+いずれの経路も **精度を保証するものではない**。Windows はハードリアルタイム OS ではなく、
+スケジューラ・電源管理・仮想化の影響で実測値は変動する。
 
 ---
 
@@ -429,7 +472,8 @@ Unity 向けでは `USLP_X64_ONLY` は通常指定しない（マルチプラッ
 - **例外の内部捕捉**: `EntryPointNotFoundException` は `GetTimer()` 内で捕捉済み。呼び出し元への漏洩なし
 - **タイマーハンドルの共有なし**: `[ThreadStatic]` により各スレッドが独立したハンドルを保持
 - **タイマー分解能の重複設定防止**: `_timerResolutionLock` による排他制御で `timeBeginPeriod` の二重呼び出しを防止
-- **整数オーバーフロー（Unity/USLP_WINDOWS）**: `NowUs()` の QPC 計算 `c.QuadPart * 1_000_000L / _qpcFreq` は `long` 演算。QPC カウンタが `long.MaxValue / 1_000_000` を超えるのは数千年後であり実用上問題なし。NuGet ビルドでは `NativeClock.GetTimestamp() * _tickToUs`（浮動小数点乗算）を使用するため整数オーバーフローは発生しない
+- **整数オーバーフロー（Unity/USLP_WINDOWS）**: `NowUs()` の QPC 計算 `c.QuadPart * 1_000_000L / _qpcFreq` は `long` 演算。QPC カウンタが `long.MaxValue / 1_000_000` を超えるのは数千年後であり実用上問題なし。NuGet ビルド（`USLP_GENERATOR`）では `Stopwatch.GetTimestamp() * _tickToUs`（浮動小数点乗算）を使用するため同様に整数オーバーフローは発生しない
+- **テスト用の内部可視化**: `USLP_GENERATOR` ビルドのみ、`src/AssemblyAttributes.cs` で `[assembly: InternalsVisibleTo("UsleepWin.Tests")]` を宣言している。`TimerWheel` / `PreciseWaitItem` は `internal` のままだが、境界条件（過去 deadline の大量投入、ホイール範囲外の deadline）は `PreciseDelay` 越しの結合テストでは再現できないため、テストアセンブリから直接操作できるようにしている。公開 API の可視性には影響しない
 
 ---
 
@@ -442,51 +486,109 @@ Unity 向けでは `USLP_X64_ONLY` は通常指定しない（マルチプラッ
 `PreciseDelay` は `UsleepWin` では達成できない **±1〜3 µs** 精度の非同期待機を提供する静的クラス。
 専用スピンスレッド・タイマーホイール・`IValueTaskSource` プールの組み合わせにより、**ゼロアロケーション**での高精度スケジューリングを実現する。
 
-NuGet ターゲット（`net10.0-windows`）専用。Unity DLL ビルドでは `#if !USLP_UNITY` により全5ファイルがコンパイルから除外される。
+NuGet ターゲット（`net10.0-windows`）専用。Unity DLL ビルドでは `#if !USLP_UNITY` により全4ファイルがコンパイルから除外される。
 
 ### 14.2 クラス構成
 
 | クラス / ファイル | 役割 |
 | --- | --- |
-| `NativeClock` (`src/NativeClock.cs`) | `KUSER_SHARED_DATA`（アドレス `0x7FFE0000`）直読みによる ~1 ns タイムスタンプ取得。P/Invoke ゼロのホットパス。OS または値が非信頼の場合は `Stopwatch.GetTimestamp()` にフォールバック |
 | `PreciseWaitItem` (`src/PreciseWaitItem.cs`) | `IValueTaskSource` + `ObjectPool<T>` による待機アイテム。`ManualResetValueTaskSourceCore<bool>` でゼロアロケーション `ValueTask` を発行 |
-| `TimerWheel` (`src/TimerWheel.cs`) | スロット数 4096 のタイマーホイール。`Math.BigMul` を使ったマジックナンバー除算で O(1) スロット計算 |
+| `TimerWheel` (`src/TimerWheel.cs`) | スロット数 8192 のタイマーホイール。素直な `long` 除算で O(1) スロット計算 |
 | `SpinCoreEngine` (`src/SpinCoreEngine.cs`) | 専用 CPU コアに固定されたスピンスレッド。`NtSetTimerResolution(1)` でシステムタイマー分解能を最小化し、`TimerWheel.Advance()` をタイトループで呼び出す |
 | `PreciseDelay` (`src/PreciseDelay.cs`) | 公開 API。≤5 ms はスピンパス、>5 ms は WaitableTimer HR パスに自動振り分け |
 
-### 14.3 NativeClock の実装
+時刻源には `Stopwatch.GetTimestamp()` を使う。以前は `KUSER_SHARED_DATA` を直読みする
+`NativeClock`（`src/NativeClock.cs`）が存在したが撤去済み。理由は第 4 章「時刻取得」を参照。
 
-`KUSER_SHARED_DATA` 構造体のオフセット `0x320`（`InterruptTime`）を `unsafe` ポインタで直接読む。
-64 ビット値が 2 回の 32 ビット読み取りにまたがるため、High → Low → High の順に読み取り、High が一致するまでリトライする（ティア読み取りパターン）。
+### 14.3 PreciseWaitItem のプール返却タイミング
 
-```text
-address = (byte*)0x7FFE0000 + 0x320
-loop:
-    hi1 = *(uint*)(address + 4)
-    lo  = *(uint*)(address)
-    hi2 = *(uint*)(address + 4)
-    if hi1 == hi2: return (long)((ulong)hi1 << 32 | lo)
+`Complete()` / `CompleteAsCancelled()` の完了時点ではプールへ返却**しない**。返却は
+`GetResult()`（＝呼び出し元が `await` を通じて結果を受け取った時点）で行う。
+
+```csharp
+public void GetResult(short token)
+{
+    try { _vtsc.GetResult(token); }
+    finally { PreciseWaitItemPool.Return(this); }
+}
 ```
 
-値は 100 ns 単位。`Stopwatch.Frequency` ベースの係数でスケールし、`Stopwatch.GetTimestamp()` と同じ単位に変換する。
+**理由:** 完了時点（`Complete()`）で返却すると、呼び出し元がまだ `await` していない間に
+別スレッドが同じインスタンスを `Rent()` して `Reset()` を呼ぶ可能性がある。`Reset()` は
+`ManualResetValueTaskSourceCore<bool>.Reset()` を呼ぶため `_vtsc.Version` が変わり、
+未 `await` の `ValueTask` が保持していた古いトークンと不一致になって壊れる。
+返却を `GetResult()` まで遅らせることで、呼び出し元が確実に結果を受け取り終えてから
+インスタンスが再利用される。
+
+`Complete()` / `CompleteAsCancelled()` は `SpinLoop`（スピンスレッド単独）からのみ呼ぶ設計で、
+`Interlocked` は使用しない。`IsInitialized` フラグで use-after-free を防止する。
 
 ### 14.4 TimerWheel の設計
 
-#### スロット計算（O(1) マジックナンバー除算）
+#### スロット計算（素直な long 除算）
 
-`ticksPerSlot = Stopwatch.Frequency / 1_000_000`（1 µs あたりのティック数）を構築時に計算し、その逆数に相当するマジックマルチプライヤを `ComputeMagicNumbers()` で導出する。
+`_ticksPerSlot = Stopwatch.Frequency / 1_000_000`（1 µs あたりのティック数）を構築時に計算し、
+スロット番号は `diff / _ticksPerSlot` の単純な `long` 除算で求める。
 
 ```text
-slot = (diff × magicMultiplier) >> (magicShift - 64)  [上位 64 ビット]
-     & SlotMask
+diff = timestamp - _baseTimestamp   （_baseTimestamp は構築時に固定）
+slot = diff / _ticksPerSlot
 ```
 
-`diff = timestamp - _baseTimestamp`（`_baseTimestamp` は構築時に固定）。
-`long` の範囲内でオーバーフローするまでは **約 29,000 年**（QPC 周波数 ~10 MHz 基準）であり実用上問題なし。
+`diff` は `long` の範囲内でオーバーフローするまで **約 29,000 年**（QPC 周波数 ~10 MHz 基準）
+であり実用上問題ない。
 
-#### `ResetBase()` を削除した理由
+> **Magic Number 除算（`Math.BigMul`）を撤去した理由**
+>
+> 以前は逆数に相当するマジックマルチプライヤを `ComputeMagicNumbers()` で求め、
+> `(diff × magicMultiplier) >> (magicShift - 64)` で除算を回避していた。しかしこの
+> 乗数の計算式 `2^(64+log2(d)+1) / d` は `d = 10`（1µs あたり 10 ティック。
+> `Stopwatch.Frequency = 10 MHz` は Windows で最も一般的な値であり、例外的な環境ではない）
+> のとき `2.95 × 10^19` となり `ulong`（最大 `1.84 × 10^19`）を溢れ、下位 64 ビットだけが
+> 残っていた。実効係数は `1/10 = 0.1` ではなく `0.0375` となり、1 スロットは 1 µs ではなく
+> **約 2.67 µs** として動作していた。
+>
+> したがってホイールの実効範囲は狭まるのではなく逆に約 2.67 倍（4096 スロットで約 10.9 ms）に
+> 広がっていた。実害は範囲不足による早期完了ではなく、**待機の粒度が 2.67 µs に量子化され、
+> `PreciseDelay` が目標とする ±1〜3 µs が成立しない**ことである。
+> 素直な `long` 除算は 1 回あたり数 ns で、スピンループ 1 反復（`Stopwatch.GetTimestamp()`
+> 実測 ~20 ns を含む）に対して支配的でないため、正しさを優先して単純な除算に戻した。
 
-仕様書の初期版では `_baseTimestamp` をリセットする `ResetBase()` メソッドが存在したが、**既にキュー済みのアイテムのスロットインデックスが旧 base 基準で格納されているため、リセット後に最大 ~4 ms の遅延が発生するバグ**が判明した。`_baseTimestamp` を `readonly` にして構築時1回だけ設定することで問題を根本解消した。
+#### コンストラクタでの範囲検証
+
+`TimerWheel` のコンストラクタは扱う必要のある最大待機時間 `requiredSpanMicroseconds`（µs）を
+引数に取る。実際に表現できる範囲は `Stopwatch.Frequency` に依存するため（`_ticksPerSlot` は
+切り捨て演算のため、周波数が 1 MHz の倍数でない環境では 1 スロットが 1 µs 未満になりうる）、
+構築時に `spanUs = SlotCount * _ticksPerSlot * 1_000_000 / Stopwatch.Frequency` を計算し、
+`requiredSpanMicroseconds` に満たなければ `NotSupportedException` を投げる。
+`Debug.Assert` は使わない（Release ビルドで消えるうえ、.NET では失敗時にプロセスが即死するため）。
+
+`SpinCoreEngine.Initialize()` は `PreciseDelay.SpinPathMaxMilliseconds`（5 ms）を渡してこの
+検証を行う。
+
+#### 絶対スロット番号と Advance / Enqueue
+
+`_currentSlot` は折り返しのない絶対スロット番号として保持する（マスク後の値だけでは
+前後関係を判別できないため）。`Advance()` は現在時刻に対応するスロットまで 1 スロットずつ
+進めて消化する。1 周以上遅れている場合（スピンスレッド起動直後やプリエンプト明けなど）は
+全スロットを 1 回だけ掃いて追いつく。
+
+`Enqueue()` で締切が既に現在スロット以前（過去）の場合は、キューに入れずその場で
+`Complete()` / `CompleteAsCancelled()` を呼んで完了させる。「現在スロットへまとめて入れる」
+方式は採らない。過去 deadline がバーストで届いた場合に 1 スロットへ集中し、
+`MaxSlotCapacity`（1024）超過で `GrowSlot()` が例外を投げてスピンスレッドごとプロセスが
+落ちるため。`Complete()` はスピンスレッド単独で呼ぶ規約だが、`Enqueue()` の呼び出し元は
+`SpinLoop` のみなのでこの規約は保たれている。
+
+締切がホイールの表現範囲（`SlotCount` スロット分）を超えている場合は、折り返して過去の
+スロットに落ちて早期完了するのを避けるため、表現できる最遠のスロットへ丸める。
+`SpinLoop` は `_incoming` の drain ループ中でも `Advance()` を呼んで `_currentSlot` を
+最新に保つため、通常この分岐には到達しない。
+
+#### Dispose
+
+`TimerWheel.Dispose()` は `_disposed` フラグを立てるのみ。呼び出し元（`SpinCoreEngine`）は
+スピンスレッドの `Thread.Join()` が成功したときだけこれを呼ぶ（詳細は 14.6 節）。
 
 ### 14.5 WaitAsync のルーティング
 
@@ -512,17 +614,23 @@ WaitableTimer HR パスでは `ThreadPool.RegisterWaitForSingleObject` を使用
 
 `Initialize()` 内では `SpinCoreEngine` の一時変数に代入してから `Initialize()` を呼び、成功した場合のみ `_engine` フィールドに代入する（例外時に `IsInitialized` が `true` になるバグを防止）。
 
+`SpinCoreEngine.Dispose()` は `_running = false` を立てたのち、スピンスレッドの
+`Thread.Join(TimeSpan.FromSeconds(1))` が **成功したときだけ** `TimerWheel.Dispose()` を
+呼ぶ。まだスピンスレッドが動いている状態で `_disposed` を立てた `TimerWheel` に触らせると、
+次の `Enqueue()` が `ObjectDisposedException` を投げてスピンスレッドごとプロセスが落ちるため。
+`Join` がタイムアウトした場合はホイールを解放せず GC に委ねる。
+
 ### 14.7 関連ファイル
 
 | ファイル | 内容 |
 | --- | --- |
-| [src/NativeClock.cs](../src/NativeClock.cs) | KUSER_SHARED_DATA 直読みタイムスタンプ |
 | [src/PreciseWaitItem.cs](../src/PreciseWaitItem.cs) | IValueTaskSource + ObjectPool 待機アイテム |
-| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) マジックナンバー除算タイマーホイール |
+| [src/TimerWheel.cs](../src/TimerWheel.cs) | O(1) タイマーホイール（8192 スロット、long 除算） |
 | [src/SpinCoreEngine.cs](../src/SpinCoreEngine.cs) | 専用コアスピンスレッドエンジン |
 | [src/PreciseDelay.cs](../src/PreciseDelay.cs) | 公開 API（Initialize / Shutdown / WaitAsync） |
-| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | 全 18 件のテスト |
-| [document/test_result.md](test_result.md) | テスト結果レポート（全 33 件合格） |
+| [tests/UsleepWin.Tests/PreciseDelayTests.cs](../tests/UsleepWin.Tests/PreciseDelayTests.cs) | `PreciseDelay` の結合テスト + `TimerWheel` 境界条件の直接テスト（`InternalsVisibleTo` 経由） |
+| [tests/UsleepWin.UnityWindows.Tests](../tests/UsleepWin.UnityWindows.Tests) | Unity Windows バリアント（`USLP_UNITY` + `USLP_WINDOWS`）のスモークテスト。`DllImport` 版 P/Invoke と QPC 経路を実行時に踏ませる。CoreCLR 上での検証であり Mono / IL2CPP の検証ではない |
+| [document/test_result.md](test_result.md) | テスト結果レポート（初回実施時点のスナップショット。最新のテスト件数はテストプロジェクトを参照） |
 
 ---
 

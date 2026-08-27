@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>preview</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <AssemblyName>UsleepWin.UnityWindows.Tests</AssemblyName>
+    <RootNamespace>UsleepWin.UnityWindows.Tests</RootNamespace>
+
+    <!--
+      Unity Windows バリアントと同じ条件コンパイル定数で src をコンパイルする。
+      USLP_UNITY  … PreciseDelay 系を除外
+      USLP_WINDOWS … DllImport 版の P/Invoke を有効化（USLP_GENERATOR は付けない）
+
+      TFM は netstandard2.1 ではなく net10.0-windows。netstandard2.1 で API が
+      存在するかはビルド（build_unity_windows.bat）が担保する。ここで検証したいのは
+      「DllImport 経路と QPC 経路が実行時に正しく動くか」で、これは
+      netstandard2.1 の DLL をビルドするだけでは一度も実行されない。
+
+      検証していないこと（過信しないこと）:
+        - これは CoreCLR 上での DllImport の実行であって、Unity の Mono / IL2CPP
+          での検証ではない。差が出やすいのはまさにマーシャリングで、
+          DllImport 版の bool 戻り値に [MarshalAs] が無い点や CharSet.Unicode 依存、
+          [SuppressUnmanagedCodeSecurity]（CoreCLR では no-op）はここでは確かめられない。
+        - netstandard2.1 での API 存在確認。src に TFM 条件（#if NET… / #if NETSTANDARD…）
+          が入ると、このテストは通るのに build_unity_windows.bat が落ちるようになる。
+        - build_unity_windows.bat 自体の正しさ（バッチを実行しないため）。
+          そもそもの発端だった %3B の不具合はここでは検出できない。
+    -->
+    <DefineConstants>$(DefineConstants);USLP_UNITY;USLP_WINDOWS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit" Version="2.*" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.*">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
+  </ItemGroup>
+</Project>

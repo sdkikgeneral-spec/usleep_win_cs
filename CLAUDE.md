@@ -24,12 +24,35 @@ clean.bat                  :: bin/obj と dotnet clean
 .\build_and_zip.ps1        # 全ターゲットをビルドし usleep_win_cs_<version>.zip を生成（.nupkg は含まない）
 ```
 
-テスト（**`.sln` にテストプロジェクトは含まれていない**ため、パス指定が必須）:
+テストは 2 プロジェクトあり、**それぞれ別のビルドバリアントを検証する**。
+**`.sln` にどちらも含まれていない**ため、パス指定が必須。
+
+| プロジェクト | 検証対象 | ランタイム | 実行方法 |
+|---|---|---|---|
+| `tests/UsleepWin.Tests` | NuGet バリアント（`pack` を ProjectReference） | CoreCLR | `dotnet test` |
+| `tests/UsleepWin.UnityWindows.Tests` | Unity Windows バリアント（`src` を `USLP_UNITY`+`USLP_WINDOWS` で直接 Compile） | CoreCLR | `dotnet test` |
+| `tests/UnityEditor.Tests` | 上と同じ DLL を Unity Editor 上で実行 | **Mono** | `.\run_unity_tests.ps1` |
+
+Unity Windows 側は `DllImport` 版の P/Invoke と QPC 経路を通る。ビルドが通るだけでは
+実行時の正しさが分からないため、スモークテストで実際に踏ませている
+（このバリアントは `build_unity_windows.bat` の不具合で長らくビルドすら通っていなかった）。
+
+**CoreCLR 上の検証と Mono 上の検証は別物で、実際に差がある。**
+最たる例が `Stopwatch.GetTimestamp()` の基準で、CoreCLR は QPC そのものを返すため
+ブート基準だが、**Mono ではプロセス基準**（Unity Editor 実測: QPC 96,241,844,336µs =
+`GetTickCount64` と一致、Mono の Stopwatch は 2,843,839µs = Unity 起動から 2.8 秒）。
+`NowSteadyMicroseconds()` の絶対値を検証するテストで `Stopwatch` を物差しに使うと
+Mono で誤検出するので、`GetTickCount64`（両環境ともブート基準）と比較すること。
+なお `Environment.TickCount64` は netstandard2.1 に無いため Unity 側では使えない。
+
+**IL2CPP はさらに別のマーシャリング実装で、上記いずれでも検証されていない。**
+
 
 ```powershell
 dotnet test tests\UsleepWin.Tests\UsleepWin.Tests.csproj
 dotnet test tests\UsleepWin.Tests\UsleepWin.Tests.csproj --filter "FullyQualifiedName~PreciseDelay"
 dotnet test tests\UsleepWin.Tests\UsleepWin.Tests.csproj --filter "DisplayName~SleepMicroseconds_ZeroDoesNotThrow"
+dotnet test tests\UsleepWin.UnityWindows.Tests\UsleepWin.UnityWindows.Tests.csproj
 ```
 
 サンプル実行: `dotnet run --project samples\ConsoleDemo`

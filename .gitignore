@@ -8,3 +8,21 @@ unity/obj/
 tests/UsleepWin.Tests/bin/
 tests/UsleepWin.Tests/obj/
 *.zip
+tests/UsleepWin.UnityWindows.Tests/bin/
+tests/UsleepWin.UnityWindows.Tests/obj/
+
+# Unity テストプロジェクト（生成物。Assets/Tests と Packages/ProjectSettings のみ追跡する）
+tests/UnityEditor.Tests/Library/
+tests/UnityEditor.Tests/Temp/
+tests/UnityEditor.Tests/Logs/
+tests/UnityEditor.Tests/obj/
+tests/UnityEditor.Tests/UserSettings/
+tests/UnityEditor.Tests/Assets/Plugins/
+tests/UnityEditor.Tests/results.xml
+tests/UnityEditor.Tests/unity.log
+tests/UnityEditor.Tests/*.csproj
+tests/UnityEditor.Tests/*.sln
+tests/UnityEditor.Tests/*.slnx
+tests/UnityEditor.Tests/.vsconfig
+tests/UnityEditor.Tests/Assets/Resources/
+tests/UnityEditor.Tests/Assets/Resources.meta
