@@ -494,6 +494,12 @@ A dedicated spin thread, timer wheel, and `IValueTaskSource` pool combine to del
 
 NuGet target (`net10.0-windows`) only. All four source files are excluded from Unity DLL builds via `#if !USLP_UNITY`.
 
+> **The ±1–3 µs target only holds on the spin path (≤5 ms, `SpinCoreEngine`).**
+> The >5 ms `WaitableTimerAsync` path is coarser, and — as described in section 14.5.1 —
+> falls back all the way to `DelayFallbackAsync` (which internally repeats
+> `Task.Delay`) if the native calls fail. Windows is not a
+> hard real-time OS, so neither path can guarantee "always within ±N µs".
+
 ### 14.2 Class Overview
 
 | Class / File | Role |
@@ -622,6 +628,106 @@ On the spin path, `PreciseWaitItemPool.Rent()` obtains a wait item and `TimerWhe
 On the WaitableTimer HR path, `ThreadPool.RegisterWaitForSingleObject` is used. The `SafeWaitHandle` is wrapped in an `EventWaitHandle` to satisfy the `WaitHandle` parameter requirement.
 
 The returned `RegisteredWaitHandle` is kept and `Unregister(null)` is called in a `finally` block before disposing the `EventWaitHandle`. On cancellation the registration is still live; without unregistering, the thread pool's wait slot and callback would stay alive until the timer fires — that is the purpose of `Unregister`. The order matters: `Unregister` must come first and must not be swapped. Note that a registered handle is protected by the reference count `RegisterWaitForSingleObject` takes on the `SafeWaitHandle`, so `Dispose()` alone would not call `CloseHandle`; that is a BCL implementation detail and is not relied upon. Disposing the `EventWaitHandle` also releases the timer handle through its `SafeWaitHandle`.
+
+`EventWaitHandle`'s default constructor creates it with its own `SafeWaitHandle` (an
+event object), which is then swapped out for the timer handle. The original
+`SafeWaitHandle`, no longer needed after the swap, is explicitly disposed on the
+spot instead of being left to the finalizer.
+
+### 14.5.1 `WaitableTimerAsync` Staged Fallback
+
+`WaitableTimerAsync` (the >5 ms path) never throws on native call failure; instead
+it degrades in stages, in the following order. The policy of "degrade without
+throwing" is shared with the synchronous side's `InternalTiming.SleepByTimer()`
+(section 6.2), but **the stages themselves are not identical**. The synchronous
+side's fallback to the non-Ex `CreateWaitableTimer`, and its process-wide memoization
+of failures (`_createWaitableTimerExState`), have no counterpart here.
+`CreateWaitableTimerExW` has existed since Windows 8, and the only variant in which
+this file is compiled is `net10.0-windows` (minimum requirement Windows 10 1607), so
+the `EntryPointNotFoundException` path is effectively unreachable — which is why
+there is no value in adding the extra static state.
+
+```text
+0. ct.ThrowIfCancellationRequested()
+     already cancelled → throw OperationCanceledException (carrying ct) before
+     acquiring any kernel object
+1. CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+     succeeds → wait on this HR timer
+     fails →
+2. CreateWaitableTimerExW(NULL, NULL, 0 /* no HR flag */, TIMER_ALL_ACCESS)
+     succeeds → wait on this non-HR timer
+     fails, or EntryPointNotFoundException
+       (environment where CreateWaitableTimerExW itself does not exist) →
+3. fall back to DelayFallbackAsync(delay, ct)
+
+In addition, if SetWaitableTimer(handle, ...) on a handle obtained in step 1 or 2
+returns FALSE, it likewise falls back to DelayFallbackAsync(delay, ct).
+```
+
+- **No exception is thrown on any failure branch (except the step-0 pre-check).**
+  Previously, an invalid handle was passed straight through to
+  `RegisterWaitForSingleObject` on failure, which meant a call without a `ct` would
+  hang forever. Now, as soon as any of the above failures is detected, the wait
+  falls back to `DelayFallbackAsync`, so it no longer hangs.
+- **The fallback target is `DelayFallbackAsync`, not a bare `Task.Delay`.**
+  `Task.Delay` follows the internal timer's tick granularity and can return
+  slightly earlier than requested. To match the synchronous side's
+  `InternalTiming.SleepByTimer`, which always tops up to the target time at every
+  degradation level to preserve the "never returns early" invariant, the async side
+  now provides the same lower-bound guarantee. `DelayFallbackAsync` checks the
+  actual elapsed time via `Stopwatch.GetTimestamp()` and, if time remains, repeats
+  `Task.Delay` to top it up. Spinning (busy-waiting) is never used to top up; this
+  path is the power-saving-side fallback, and an async method must not burn a
+  thread. The error is **one-sided (positive only)**: the wait may run long, but
+  will never return early. The upper bound of how long it may run is not
+  guaranteed, since Windows is not a hard real-time OS.
+  ```text
+  DelayFallbackAsync(delay, ct):
+      start = Stopwatch.GetTimestamp()
+      targetTicks = delay converted to Stopwatch ticks (overflow-safe)
+      remaining = delay
+      repeat (budget = FallbackConvergenceMargin(8) + delay.Ticks / MaxSingleDelay.Ticks times):
+          clamp remaining to [MinSingleDelay(1ms), MaxSingleDelay(uint.MaxValue-1 ms)]
+          await Task.Delay(remaining, ct)
+          remainTicks = targetTicks - (Stopwatch.GetTimestamp() - start)
+          if remainTicks <= 0: return
+          remaining = remainTicks converted back from Stopwatch ticks
+  ```
+  The iteration budget used to be a fixed `MaxFallbackIterations = 64`, but for
+  waits beyond roughly 1590 days the chunking alone would exhaust all 64
+  iterations, leaving no convergence margin and silently breaking the "never
+  returns early" lower-bound guarantee with no diagnostic or exception. It was
+  therefore changed to be derived from `delay`:
+  `budget = FallbackConvergenceMargin(8) + delay.Ticks / MaxSingleDelay.Ticks`
+  (the loop itself remains structurally bounded, `for (long i = 0; i < budget; i++)`).
+  The convergence margin of 8 is a safety cushion: `Task.Delay`'s early returns
+  come from internal `TimerQueue` tick-boundary rounding and drift by at most one
+  tick per call (about 15.6 ms at the default timer resolution), so convergence
+  normally takes only 1–3 iterations.
+- **No exception even for waits beyond ~49.7 days.** `Task.Delay` throws
+  `ArgumentOutOfRangeException` once the value exceeds the internal `Timer`'s limit
+  (`Timer.MaxSupportedTimeout` = 4294967294 ms, ≈ 49.7 days), but `SetWaitableTimer`
+  has no such limit. Passing the value straight through to a bare `Task.Delay` would
+  produce an inconsistent degradation — working when the native timer succeeds but
+  throwing only on the fallback. `DelayFallbackAsync` therefore clamps each
+  individual wait to `MaxSingleDelay` (`uint.MaxValue - 1` ms = 4294967294 ms,
+  i.e. `Timer.MaxSupportedTimeout` itself) and accumulates the remainder across
+  loop iterations.
+- **Accuracy**: even once fallen back to `DelayFallbackAsync`, accuracy still
+  depends on OS timer resolution (typically 1–15 ms granularity). This >5 ms path
+  was never a path that guaranteed ±1–3 µs to begin with (that target applies only
+  to the spin path — see section 14.1), so the accuracy loss from the fallback is
+  simply "something that was already not guaranteed becoming coarser still"; it
+  does not affect the spin path's accuracy contract.
+
+**Cancellation propagation:** whether cancelled via the step-0 pre-check, the
+`RegisterWaitForSingleObject` path (HR/non-HR timer), or the `DelayFallbackAsync`
+path, the caller-supplied `ct` now flows through directly into
+`OperationCanceledException.CancellationToken`. Previously `TrySetCanceled()` was
+called without a token, so a caller-side filter such as
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` would fail
+to match and let the exception pass through unhandled; it now matches correctly
+because cancellation carries `ct`.
 
 ### 14.6 Lifecycle and Safety
 

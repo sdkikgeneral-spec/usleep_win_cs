@@ -171,6 +171,46 @@ public class PreciseDelayWaitTests : IClassFixture<PreciseDelayFixture>
             $"delay={delayMs}ms, elapsed={sw.ElapsedMilliseconds}ms");
     }
 
+    /// <summary>
+    /// WaitableTimer パスをキャンセル不能トークンで待つ。
+    /// ネイティブ呼び出し失敗時に無効ハンドルを待って永久ハングした不具合の回帰防止。
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_WaitableTimerPath_NonCancellableToken_DoesNotHang()
+    {
+        const int delayMs = 20;
+        var sw = Stopwatch.StartNew();
+
+        // ハングしたら WaitAsync(TimeSpan) がタイムアウト例外を投げてテストが失敗する。
+        await PreciseDelay.WaitAsync(TimeSpan.FromMilliseconds(delayMs), CancellationToken.None)
+                          .AsTask()
+                          .WaitAsync(TimeSpan.FromSeconds(5));
+        sw.Stop();
+
+        // 上限だけでなく下限も見る（即 return する実装を通さないため）。
+        Assert.True(sw.ElapsedMilliseconds >= delayMs / 2,
+            $"delay={delayMs}ms, elapsed={sw.ElapsedMilliseconds}ms（早すぎる）");
+        Assert.True(sw.ElapsedMilliseconds < 5_000,
+            $"delay={delayMs}ms, elapsed={sw.ElapsedMilliseconds}ms（遅すぎる）");
+    }
+
+    /// <summary>
+    /// WaitableTimer パスのキャンセルで、例外に渡したトークンが載っていること。
+    /// TrySetCanceled() をトークン無しで呼んでいた不具合の回帰防止。
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_WaitableTimerPath_Cancelled_CarriesToken()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await PreciseDelay.WaitAsync(TimeSpan.FromSeconds(10), cts.Token)
+                              .AsTask()
+                              .WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+    }
+
     // ── キャンセルのテスト ─────────────────────────────────────────
 
     [Fact]
@@ -181,6 +221,25 @@ public class PreciseDelayWaitTests : IClassFixture<PreciseDelayFixture>
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
             await PreciseDelay.WaitAsync(TimeSpan.FromMilliseconds(100), cts.Token));
+    }
+
+    /// <summary>
+    /// 既にキャンセル済みのトークンで &gt;5ms（WaitableTimer 経路）を待つと、
+    /// カーネルオブジェクトを確保する前に、渡したトークン付きで即キャンセルされること。
+    /// WaitableTimerAsync 冒頭の ThrowIfCancellationRequested の回帰防止。
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_WaitableTimerPath_PreCancelled_CarriesToken()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await PreciseDelay.WaitAsync(TimeSpan.FromSeconds(10), cts.Token)
+                              .AsTask()
+                              .WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
     }
 
     [Fact]

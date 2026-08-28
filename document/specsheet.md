@@ -488,6 +488,12 @@ Unity 向けでは `USLP_X64_ONLY` は通常指定しない（マルチプラッ
 
 NuGet ターゲット（`net10.0-windows`）専用。Unity DLL ビルドでは `#if !USLP_UNITY` により全4ファイルがコンパイルから除外される。
 
+> **目標精度 ±1〜3 µs が成立するのはスピンパス（≤5 ms、`SpinCoreEngine`）のみ。**
+> >5 ms の `WaitableTimerAsync` パスはこれより粗く、14.5.1 節のとおりネイティブ呼び出しに
+> 失敗した場合は `DelayFallbackAsync`（内部で `Task.Delay` を反復する）までフォールバックする。
+> Windows はハードリアルタイム OS ではないため、いずれの経路についても
+> 「必ず ±N µs」という保証はできない。
+
 ### 14.2 クラス構成
 
 | クラス / ファイル | 役割 |
@@ -604,6 +610,94 @@ SpinCoreEngine のスピンループが `TimerWheel.Advance()` を呼び出し�
 WaitableTimer HR パスでは `ThreadPool.RegisterWaitForSingleObject` を使用する。`SafeWaitHandle` を `EventWaitHandle` でラップして `WaitHandle` 型要件を満たす。
 
 返された `RegisteredWaitHandle` は保持し、`finally` で `Unregister(null)` してから `EventWaitHandle` を `Dispose()` する。キャンセルで抜けた場合は登録がまだ生きており、解除しないと ThreadPool の待機スロットとコールバックがタイマー発火まで延命するため、これが `Unregister` の目的である。順序は `Unregister` が先で、逆にしてはならない。なお登録中のハンドルは `RegisterWaitForSingleObject` が `SafeWaitHandle` に取る参照カウントで保護されており `Dispose()` だけでは `CloseHandle` されないが、これは BCL の実装詳細なので依存しない。`EventWaitHandle.Dispose()` が `SafeWaitHandle` 経由でタイマーハンドルの解放も兼ねる。
+
+`EventWaitHandle` は既定コンストラクタで自前の `SafeWaitHandle`（イベントオブジェクト）を持って生成されるが、これをタイマーハンドルに差し替えて使う。差し替えで不要になった元の `SafeWaitHandle` はファイナライザ任せにせず、その場で明示的に `Dispose()` する。
+
+### 14.5.1 `WaitableTimerAsync` の段階的フォールバック
+
+`WaitableTimerAsync`（>5 ms パス）はネイティブ呼び出しが失敗しても例外を投げず、以下の順で
+段階的に劣化する。「例外を投げずに劣化させる」という方針は同期側
+`InternalTiming.SleepByTimer()`（6.2 節）と共有するが、**劣化の段は同一ではない**。
+同期側が持つ非 Ex 版 `CreateWaitableTimer` への降格段と、失敗をプロセス単位で
+memoize する仕組み（`_createWaitableTimerExState`）は本メソッドには無い。
+`CreateWaitableTimerExW` は Windows 8 以降に存在し、このファイルがコンパイルされる
+唯一のバリアントは `net10.0-windows`（最低要件 Windows 10 1607）なので
+`EntryPointNotFoundException` 経路が実質到達不能であり、そのために静的状態を
+増やす価値が無いという判断による。
+
+```text
+0. ct.ThrowIfCancellationRequested()
+     既にキャンセル済み → カーネルオブジェクトを確保する前に
+     OperationCanceledException（ct 付き）を投げて抜ける
+1. CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+     成功 → この HR タイマーで待機
+     失敗 →
+2. CreateWaitableTimerExW(NULL, NULL, 0 /* HR フラグなし */, TIMER_ALL_ACCESS)
+     成功 → この非 HR タイマーで待機
+     失敗、または EntryPointNotFoundException
+       （CreateWaitableTimerExW 自体が存在しない環境）→
+3. DelayFallbackAsync(delay, ct) にフォールバック
+
+さらに、2. までで取得できたハンドルに対する
+SetWaitableTimer(handle, ...) が FALSE を返した場合も
+同様に DelayFallbackAsync(delay, ct) にフォールバックする。
+```
+
+- **どの失敗経路でも例外は投げない（0. の事前キャンセルチェックを除く）。**
+  従来は失敗時に無効ハンドルをそのまま `RegisterWaitForSingleObject` に渡しており、
+  `ct` を指定しない呼び出しでは待機が永久にハングする不具合があった。現在は上記
+  いずれかの失敗を検知した時点で `DelayFallbackAsync` にフォールバックするため、
+  ハングしない。
+- **フォールバック先は素の `Task.Delay` ではなく `DelayFallbackAsync`。**
+  `Task.Delay` は内部タイマーの tick 粒度に従うため要求より僅かに早く復帰しうるが、
+  同期側 `InternalTiming.SleepByTimer` がどの劣化段でも最後に目標時刻まで詰めて
+  「要求時間より早く返らない」不変条件を保つのに揃え、非同期側もこれと同じ下限保証を
+  持つ。`DelayFallbackAsync` は `Stopwatch.GetTimestamp()` で実経過を検証し、
+  残りがあれば `Task.Delay` を繰り返して要求時間まで詰める。詰めにスピン
+  （busy-wait）は使わない。このパスは省電力側のフォールバックであり、非同期
+  メソッドがスレッドを焼いてはならないため。誤差は**プラス方向のみ**（遅れうるが
+  早く返ることはない）。上限側の遅れ幅は Windows がハードリアルタイム OS ではない
+  ため保証しない。
+  ```text
+  DelayFallbackAsync(delay, ct):
+      start = Stopwatch.GetTimestamp()
+      targetTicks = delay をタイマー刻みへ変換（オーバーフロー保護あり）
+      remaining = delay
+      repeat（budget = FallbackConvergenceMargin(8) + delay.Ticks / MaxSingleDelay.Ticks 回）:
+          remaining を [MinSingleDelay(1ms), MaxSingleDelay(uint.MaxValue-1 ms)] にクランプ
+          await Task.Delay(remaining, ct)
+          remainTicks = targetTicks - (Stopwatch.GetTimestamp() - start)
+          remainTicks <= 0 なら return
+          remaining = remainTicks をタイマー刻みから変換
+  ```
+  反復予算はかつて `MaxFallbackIterations = 64` という固定値だったが、約 1590 日超の
+  待機ではチャンク分割回数だけで 64 を使い切り、収束用の余裕なくループを抜けて
+  「要求時間より早く返らない」下限保証が無警告で破れうる不具合があったため、
+  `budget = FallbackConvergenceMargin(8) + delay.Ticks / MaxSingleDelay.Ticks` という
+  `delay` から導出する形（ループ自体は `for (long i = 0; i < budget; i++)` で構造的に
+  有界のまま）に改めた。収束用の余裕 8 は、`Task.Delay` の早期復帰が内部 `TimerQueue`
+  の tick 境界丸めに由来し 1 回あたり最大 1 tick（既定分解能で約 15.6ms）しかずれない
+  ため、通常 1～3 反復で収束することに対する保険。
+- **49.7 日超の待機でも例外を投げない。** `Task.Delay` は内部 `Timer` の上限
+  （`Timer.MaxSupportedTimeout` = 4294967294 ms ≒ 49.7 日）を超えると
+  `ArgumentOutOfRangeException` を投げるが、`SetWaitableTimer` にはこの上限が無い。
+  素の `Task.Delay` をそのまま渡すと「タイマー成功時は動くのにフォールバック時だけ
+  例外」という筋の通らない劣化になるため、`DelayFallbackAsync` は 1 回あたりの
+  待機を `MaxSingleDelay`（`uint.MaxValue - 1` ms = 4294967294 ms、
+  `Timer.MaxSupportedTimeout` そのもの）でクランプし、ループで積み上げる。
+- **精度**: `DelayFallbackAsync` に落ちた場合でも、精度は OS タイマー分解能
+  （典型 1〜15 ms 粒度）に依存する。この >5 ms パス自体がそもそも ±1〜3 µs を
+  保証する経路ではない（±1〜3 µs はスピンパス限定、14.1 節参照）ため、フォールバック
+  による精度低下は「元々保証していなかったものがさらに粗くなる」だけであり、
+  スピンパスの精度契約には影響しない。
+
+**キャンセルの伝播:** `ct` によるキャンセルは、0. の事前チェック、
+`RegisterWaitForSingleObject` 経由の待機（HR/非 HR タイマー経路）、
+`DelayFallbackAsync` 経路のいずれでも、呼び出し側が渡した `ct` がそのまま
+`OperationCanceledException.CancellationToken` に載る。従来は
+`TrySetCanceled()` をトークン無しで呼んでいたため、呼び出し側の
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` のような
+フィルタが一致せず素通りしていたが、現在は `ct` 付きでキャンセルするため一致する。
 
 ### 14.6 ライフサイクルと安全性
 
