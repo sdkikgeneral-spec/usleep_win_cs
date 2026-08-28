@@ -369,7 +369,7 @@ JIT コンパイラによるループ最適化・インライン展開を促し�
 | フィールド | 型 | 既定値 | 説明 |
 |---|---|---|---|
 | `_profile` | `UsleepProfile` | `BALANCED` | 現在のプロファイル |
-| `_tailSpinUs` | `uint` | `250` | タイマー後スピン時間（µs） |
+| `_tailSpinUs` | `uint` | `250` | タイマー後スピン時間（µs）。`SetTailSpinMicroseconds` は上限 `MaxTailSpinMicroseconds`(10000µs) を超える値を `ArgumentOutOfRangeException` で拒否し、設定を変更しない（C++ 版 `USLEEP_SPIN_LAST_US_MAX` と同値）。テールスピン区間は 1 コアを 100% 占有するため、上限が無いとあらゆる待機が純ビジースピンに化ける |
 | `_yieldPolicy` | `UsleepYieldPolicy` | `SLEEP0` | 協調的スレッド譲渡方法 |
 
 ### `InternalTiming`（内部状態）
@@ -602,6 +602,8 @@ delay > 5 ms       → WaitableTimerAsync（WaitableTimer HR パス）
 SpinCoreEngine のスピンループが `TimerWheel.Advance()` を呼び出してスロットを消化し、`PreciseWaitItem.Complete()` → `IValueTaskSource.SetResult()` で待機側を再開する。
 
 WaitableTimer HR パスでは `ThreadPool.RegisterWaitForSingleObject` を使用する。`SafeWaitHandle` を `EventWaitHandle` でラップして `WaitHandle` 型要件を満たす。
+
+返された `RegisteredWaitHandle` は保持し、`finally` で `Unregister(null)` してから `EventWaitHandle` を `Dispose()` する。キャンセルで抜けた場合は登録がまだ生きており、解除しないと ThreadPool の待機スロットとコールバックがタイマー発火まで延命するため、これが `Unregister` の目的である。順序は `Unregister` が先で、逆にしてはならない。なお登録中のハンドルは `RegisterWaitForSingleObject` が `SafeWaitHandle` に取る参照カウントで保護されており `Dispose()` だけでは `CloseHandle` されないが、これは BCL の実装詳細なので依存しない。`EventWaitHandle.Dispose()` が `SafeWaitHandle` 経由でタイマーハンドルの解放も兼ねる。
 
 ### 14.6 ライフサイクルと安全性
 

@@ -375,7 +375,7 @@ The following fields are all `[ThreadStatic]`. Each thread holds its own indepen
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `_profile` | `UsleepProfile` | `BALANCED` | Current active profile |
-| `_tailSpinUs` | `uint` | `250` | Post-timer spin duration (µs) |
+| `_tailSpinUs` | `uint` | `250` | Post-timer spin duration (µs). `SetTailSpinMicroseconds` rejects values above `MaxTailSpinMicroseconds` (10000 µs) with `ArgumentOutOfRangeException` and leaves the setting unchanged (same value as the C++ `USLEEP_SPIN_LAST_US_MAX`). The tail spin window occupies one core at 100%, so without an upper bound any wait degenerates into a pure busy spin |
 | `_yieldPolicy` | `UsleepYieldPolicy` | `SLEEP0` | Cooperative yield method |
 
 ### `InternalTiming` (Internal State)
@@ -620,6 +620,8 @@ delay > 5 ms       → WaitableTimerAsync (WaitableTimer HR path)
 On the spin path, `PreciseWaitItemPool.Rent()` obtains a wait item and `TimerWheel.Enqueue()` registers it with a deadline. The SpinCoreEngine spin loop calls `TimerWheel.Advance()` to drain slots and resumes the awaiter via `PreciseWaitItem.Complete()` → `IValueTaskSource.SetResult()`.
 
 On the WaitableTimer HR path, `ThreadPool.RegisterWaitForSingleObject` is used. The `SafeWaitHandle` is wrapped in an `EventWaitHandle` to satisfy the `WaitHandle` parameter requirement.
+
+The returned `RegisteredWaitHandle` is kept and `Unregister(null)` is called in a `finally` block before disposing the `EventWaitHandle`. On cancellation the registration is still live; without unregistering, the thread pool's wait slot and callback would stay alive until the timer fires — that is the purpose of `Unregister`. The order matters: `Unregister` must come first and must not be swapped. Note that a registered handle is protected by the reference count `RegisterWaitForSingleObject` takes on the `SafeWaitHandle`, so `Dispose()` alone would not call `CloseHandle`; that is a BCL implementation detail and is not relied upon. Disposing the `EventWaitHandle` also releases the timer handle through its `SafeWaitHandle`.
 
 ### 14.6 Lifecycle and Safety
 

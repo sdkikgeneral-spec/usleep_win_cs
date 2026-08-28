@@ -110,8 +110,9 @@ PreciseDelay.Shutdown();
 | `SleepUntilSteadyMicroseconds(ulong targetUs)` | 指定モノトニック時刻まで待機 |
 | `NowSteadyMicroseconds()` | 現在のモノトニック時刻をマイクロ秒で取得 |
 | `SetProfile(UsleepProfile)` | プロファイル適用（スレッドローカル） |
-| `SetTailSpinMicroseconds(uint)` | タイマー後スピン時間設定（スレッドローカル） |
+| `SetTailSpinMicroseconds(uint)` | タイマー後スピン時間設定（スレッドローカル）。`MaxTailSpinMicroseconds`(10000µs) 超で `ArgumentOutOfRangeException` |
 | `SetYieldPolicy(UsleepYieldPolicy)` | スレッド譲渡ポリシー設定（スレッドローカル） |
+| `MaxTailSpinMicroseconds` | テールスピン長の上限定数（10000µs = 10ms） |
 | `SetPowerMode(UsleepPowerMode)` | スレッドの電力スロットリングモード設定 |
 | `InitTimerResolution(uint ms)` | `timeBeginPeriod` でタイマー分解能要求 |
 | `ShutdownTimerResolution()` | `timeEndPeriod` でタイマー分解能要求解除 |
@@ -250,8 +251,9 @@ PreciseDelay.Shutdown();
 | `SleepUntilSteadyMicroseconds(ulong targetUs)` | Sleep until the specified monotonic timestamp |
 | `NowSteadyMicroseconds()` | Get current monotonic timestamp in microseconds |
 | `SetProfile(UsleepProfile)` | Apply a profile (thread-local) |
-| `SetTailSpinMicroseconds(uint)` | Set post-timer spin duration (thread-local) |
+| `SetTailSpinMicroseconds(uint)` | Set post-timer spin duration (thread-local). Throws `ArgumentOutOfRangeException` above `MaxTailSpinMicroseconds` (10000 µs) |
 | `SetYieldPolicy(UsleepYieldPolicy)` | Set cooperative yield method (thread-local) |
+| `MaxTailSpinMicroseconds` | Upper bound constant for tail spin duration (10000 µs = 10 ms) |
 | `SetPowerMode(UsleepPowerMode)` | Set thread power throttling mode |
 | `InitTimerResolution(uint ms)` | Request timer resolution via `timeBeginPeriod` |
 | `ShutdownTimerResolution()` | Release timer resolution via `timeEndPeriod` |

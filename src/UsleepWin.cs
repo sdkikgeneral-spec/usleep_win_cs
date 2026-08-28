@@ -105,10 +105,37 @@ namespace Usleep.Win
         }
 
         /// <summary>
+        /// Maximum tail spin duration in microseconds accepted by
+        /// <see cref="SetTailSpinMicroseconds"/> (10 ms).
+        /// </summary>
+        /// <remarks>
+        /// テールスピン区間は 1 コアを 100% 占有するため、上限が無いと
+        /// あらゆる待機が純ビジースピンに化けて待機 API の契約が壊れる。
+        /// Windows 既定のタイマー分解能（約 15.6ms）を超える末尾スピンは
+        /// 「タイマーの粗さをスピンで隠す」という設計目的を超えて意味がなく、
+        /// 既定クォンタム（約 20〜30ms）を超えるとプリエンプトされて逆に精度が落ちる。
+        /// その下側にあたる 10ms を上限とする（C++ 版 <c>USLEEP_SPIN_LAST_US_MAX</c> と同値）。
+        /// 既定値および各プロファイルが設定する値（0 / 250 / 400）はすべて範囲内。
+        /// </remarks>
+        public const uint MaxTailSpinMicroseconds = 10000;
+
+        /// <summary>
         /// Sets tail spin duration used in the final wait phase.
         /// </summary>
         /// <param name="tailSpinUs">Tail spin duration in microseconds.</param>
-        public static void SetTailSpinMicroseconds(uint tailSpinUs) => _tailSpinUs = tailSpinUs;
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// <paramref name="tailSpinUs"/> exceeds <see cref="MaxTailSpinMicroseconds"/>.
+        /// 設定は変更されない。
+        /// </exception>
+        public static void SetTailSpinMicroseconds(uint tailSpinUs)
+        {
+            if (tailSpinUs > MaxTailSpinMicroseconds)
+                throw new ArgumentOutOfRangeException(
+                    nameof(tailSpinUs), tailSpinUs,
+                    $"tailSpinUs must be <= {MaxTailSpinMicroseconds}.");
+
+            _tailSpinUs = tailSpinUs;
+        }
 
         /// <summary>
         /// Sets cooperative yield policy used while waiting.

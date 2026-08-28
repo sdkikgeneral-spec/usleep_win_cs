@@ -115,8 +115,23 @@ public class UsleepWinTests
             Usleep.Win.UsleepWin.SetTailSpinMicroseconds(0);
             Usleep.Win.UsleepWin.SetTailSpinMicroseconds(250);
             Usleep.Win.UsleepWin.SetTailSpinMicroseconds(1000);
+            Usleep.Win.UsleepWin.SetTailSpinMicroseconds(
+                Usleep.Win.UsleepWin.MaxTailSpinMicroseconds);
         });
         Assert.Null(ex);
+
+        // 後続テストへ影響させないよう既定値へ戻す
+        Usleep.Win.UsleepWin.SetTailSpinMicroseconds(250);
+    }
+
+    [Fact]
+    public void SetTailSpinMicroseconds_AboveMaxThrows()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Usleep.Win.UsleepWin.SetTailSpinMicroseconds(
+                Usleep.Win.UsleepWin.MaxTailSpinMicroseconds + 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Usleep.Win.UsleepWin.SetTailSpinMicroseconds(uint.MaxValue));
     }
 
     [Fact]

@@ -96,24 +96,40 @@ public static class PreciseDelay
             NativeMethods.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
             NativeMethods.TIMER_ALL_ACCESS);
 
-        long dueTime = -(delay.Ticks);
-        NativeMethods.SetWaitableTimerSafe(handle, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false);
-
-        var tcs = new TaskCompletionSource(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-
-        // SafeWaitHandle を EventWaitHandle に差し替えて RegisterWaitForSingleObject に渡す
-        using var waitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+        // SafeWaitHandle を EventWaitHandle に差し替えて RegisterWaitForSingleObject に渡す。
+        // waitHandle.Dispose() がタイマーハンドルの解放も兼ねる。
+        var waitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
         waitHandle.SafeWaitHandle = handle;
 
-        ThreadPool.RegisterWaitForSingleObject(
-            waitHandle,
-            static (state, _) => ((TaskCompletionSource)state!).TrySetResult(),
-            tcs, Timeout.Infinite, executeOnlyOnce: true);
+        RegisteredWaitHandle? registered = null;
+        try
+        {
+            long dueTime = -(delay.Ticks);
+            NativeMethods.SetWaitableTimerSafe(handle, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false);
 
-        await using (ct.Register(
-            static s => ((TaskCompletionSource)s!).TrySetCanceled(), tcs))
-            await tcs.Task.ConfigureAwait(false);
+            var tcs = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+
+            registered = ThreadPool.RegisterWaitForSingleObject(
+                waitHandle,
+                static (state, _) => ((TaskCompletionSource)state!).TrySetResult(),
+                tcs, Timeout.Infinite, executeOnlyOnce: true);
+
+            await using (ct.Register(
+                static s => ((TaskCompletionSource)s!).TrySetCanceled(), tcs))
+                await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            // キャンセルで抜けた場合、登録はまだ生きている。解除しないと
+            // ThreadPool の待機スロットとコールバックがタイマー発火まで延命する。
+            // 順序は Unregister が先。登録中のハンドルは
+            // RegisterWaitForSingleObject が SafeWaitHandle に取る参照カウントで
+            // 保護されており Dispose() だけでは CloseHandle されないが、これは
+            // BCL の実装詳細なので依存せず、先に解除しておく。
+            registered?.Unregister(null);
+            waitHandle.Dispose();
+        }
     }
 }
 
