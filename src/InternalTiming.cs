@@ -14,7 +14,11 @@ internal static class InternalTiming
 
 #if USLP_WINDOWS || USLP_GENERATOR
     [ThreadStatic] private static IntPtr _tTimer;
-    private static int _createWaitableTimerExState;
+
+    // 高分解能 WaitableTimer の可用性。プロセス全体で一度だけ確定させる。
+    // -1 = 利用不可（API 欠落 or 作成失敗） / 0 = 未判定 / 1 = 利用可。
+    // 競合しても複数スレッドが同じ判定を行うだけで結果は同一なのでロックしない。
+    private static int _hrTimerState;
 #endif
 
     // Stats (thread-local)
@@ -50,14 +54,78 @@ internal static class InternalTiming
             return (ulong)(Stopwatch.GetTimestamp() * _tickToUs);
 #elif USLP_WINDOWS
         if (_isWin && _qpcFreq > 0 && QueryPerformanceCounter(out var c))
-            return (ulong)((c.QuadPart * 1_000_000L) / _qpcFreq);
+        {
+            // 商と剰余に分けた純整数演算。素直に ticks * 1_000_000 とすると
+            // QPC 10MHz ではブートから約 10.7 日で long がオーバーフローして
+            // 時刻が巻き戻る。C++ 版 qpc_now_us() と同じ計算にしてある。
+            ulong ticks = (ulong)c.QuadPart;
+            ulong f = (ulong)_qpcFreq;
+            ulong q = ticks / f;
+            ulong r = ticks % f;
+            if (q > ulong.MaxValue / 1_000_000UL) return ulong.MaxValue;
+            ulong baseUs = q * 1_000_000UL;
+            ulong remUs = (r * 1_000_000UL) / f;
+            if (baseUs > ulong.MaxValue - remUs) return ulong.MaxValue;
+            return baseUs + remUs;
+        }
 #endif
         if (_hires)
             return (ulong)(Stopwatch.GetTimestamp() * _tickToUs);
         return (ulong)(uint)Environment.TickCount * 1000UL;
     }
 
-    private static long UsTo100nsNeg(long us) => -(us * 10L);
+    /// <summary>
+    /// 現在時刻に待機長を足して deadline を作る。ラップアラウンドさせると
+    /// 「もう過ぎている」と誤判定して即座に返ってしまうため飽和させる。
+    /// </summary>
+    internal static ulong DeadlineFromNow(ulong usec)
+    {
+        var now = NowUs();
+        return usec > ulong.MaxValue - now ? ulong.MaxValue : now + usec;
+    }
+
+    private static long UsTo100nsNeg(ulong us)
+    {
+        const long k = 10L;
+        if (us > (ulong)(long.MaxValue / k)) us = (ulong)(long.MaxValue / k);
+        return -((long)us * k);
+    }
+
+    /// <summary>
+    /// 高分解能 WaitableTimer が使えるかをプロセス全体で一度だけ判定する。
+    /// 旧実装は「そのスレッドが一度長い待機をする」まで可用性が確定せず、
+    /// ウォームアップ前のスレッドがタイマー経路に入れなかった。
+    /// </summary>
+    internal static bool HasHighResolutionTimer()
+    {
+#if USLP_WINDOWS || USLP_GENERATOR
+        var s = Volatile.Read(ref _hrTimerState);
+        if (s != 0) return s > 0;
+        if (!_isWin) { Volatile.Write(ref _hrTimerState, -1); return false; }
+
+        bool ok = false;
+        try
+        {
+            var h = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (h != IntPtr.Zero)
+            {
+                ok = true;
+                // 試作したハンドルは捨てずにこのスレッドのタイマーとして使い回す。
+                if (_tTimer == IntPtr.Zero) _tTimer = h;
+                else CloseHandle(h);
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // CreateWaitableTimerExW を持たない古い Windows。
+        }
+
+        Volatile.Write(ref _hrTimerState, ok ? 1 : -1);
+        return ok;
+#else
+        return false;
+#endif
+    }
 
     private static IntPtr GetTimer()
     {
@@ -65,27 +133,21 @@ internal static class InternalTiming
         if (!_isWin) return IntPtr.Zero;
         if (_tTimer != IntPtr.Zero) return _tTimer;
 
-        var exState = System.Threading.Volatile.Read(ref _createWaitableTimerExState);
-        if (exState >= 0)
+        if (HasHighResolutionTimer())
         {
+            // 可用性判定がこのスレッドのハンドルを確保している場合がある。
+            if (_tTimer != IntPtr.Zero) return _tTimer;
             try
             {
-                _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-                if (_tTimer == IntPtr.Zero)
-                    _tTimer = CreateWaitableTimerEx(IntPtr.Zero, null, 0, TIMER_ALL_ACCESS);
-                if (_tTimer != IntPtr.Zero && exState == 0)
-                    System.Threading.Volatile.Write(ref _createWaitableTimerExState, 1);
+                var h = CreateWaitableTimerEx(IntPtr.Zero, null, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                if (h != IntPtr.Zero) return _tTimer = h;
             }
-            catch (EntryPointNotFoundException)
-            {
-                System.Threading.Volatile.Write(ref _createWaitableTimerExState, -1);
-                _tTimer = IntPtr.Zero;
-            }
+            catch (EntryPointNotFoundException) { }
         }
 
-        if (_tTimer == IntPtr.Zero)
-            _tTimer = CreateWaitableTimer(IntPtr.Zero, false, null);
-
+        // HR 不可、または HR ハンドル作成に失敗した場合は通常のタイマーで代替する。
+        // ここでプロセス全体の _hrTimerState を書き換えてはならない（スコープが違う）。
+        _tTimer = CreateWaitableTimer(IntPtr.Zero, false, null);
         return _tTimer;
 #else
         return IntPtr.Zero;
@@ -164,9 +226,9 @@ internal static class InternalTiming
 #if USLP_GENERATOR
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
 #endif
-    internal static void SleepByTimer(long usec, uint tailSpinUs, Usleep.Win.UsleepYieldPolicy policy, bool lowPowerProfile)
+    internal static void SleepByTimer(ulong usec, uint tailSpinUs, Usleep.Win.UsleepYieldPolicy policy, bool lowPowerProfile)
     {
-        var targetUs = NowUs() + (ulong)usec;
+        var targetUs = DeadlineFromNow(usec);
 
 #if USLP_WINDOWS || USLP_GENERATOR
         if (_isWin && usec > 0)
@@ -174,7 +236,7 @@ internal static class InternalTiming
             var h = GetTimer();
             if (h != IntPtr.Zero)
             {
-                long coarseUs = usec;
+                ulong coarseUs = usec;
                 if (tailSpinUs > 0 && usec > tailSpinUs) coarseUs = usec - tailSpinUs;
                 var due = new LARGE_INTEGER { QuadPart = UsTo100nsNeg(coarseUs) };
                 if (SetWaitableTimer(h, ref due, 0, IntPtr.Zero, IntPtr.Zero, false))
@@ -192,10 +254,18 @@ internal static class InternalTiming
             }
             if (usec >= 1000)
             {
-                var ms = (uint)(usec / 1000);
-                if (ms == 0) ms = 1;
-                Sleep(ms); tYieldSleep1++;
-                if (tailSpinUs > 0) SpinWithPeriodicYield(targetUs, 0, Usleep.Win.UsleepYieldPolicy.NONE);
+                ulong ms64 = usec / 1000UL;
+                if (ms64 == 0) ms64 = 1;
+                if (ms64 > uint.MaxValue) ms64 = uint.MaxValue;
+                Sleep((uint)ms64); tYieldSleep1++;
+                // Sleep(ms) は usec を ms へ切り捨てた値でしか眠らないため最大 999µs
+                // 不足しうる。tailSpinUs の値に関わらず必ず target まで詰める
+                // （tailSpinUs==0 の LOW_POWER で早期リターンさせないため。以前は
+                // ここが if (tailSpinUs > 0) だったので LOW_POWER + タイマー不可の
+                // 組み合わせで最大 999µs 早く返る契約違反があった）。
+                // 詰める残りは定義上 1ms 未満で、Sleep(ms) は実際にはほぼ必ず
+                // オーバーシュートするためこのループは通常 0 回転で抜ける。
+                SpinWithPeriodicYield(targetUs, 0, Usleep.Win.UsleepYieldPolicy.NONE);
                 return;
             }
         }

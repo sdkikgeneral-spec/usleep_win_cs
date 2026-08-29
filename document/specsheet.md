@@ -147,7 +147,13 @@ P/Invoke なし。Win32 分岐はすべてコンパイル除外。
 
 1. QPC パス（_isWin == true かつ _qpcFreq > 0）
    QueryPerformanceCounter(out c)
-   → (ulong)(c.QuadPart * 1_000_000L / _qpcFreq)
+   → ticks = (ulong)c.QuadPart, f = (ulong)_qpcFreq
+     q = ticks / f, r = ticks % f
+     q > ulong.MaxValue / 1_000_000 → ulong.MaxValue（飽和）
+     baseUs = q * 1_000_000, remUs = (r * 1_000_000) / f
+     baseUs > ulong.MaxValue - remUs → ulong.MaxValue（飽和）
+     → baseUs + remUs
+   （商と剰余に分ける純整数演算。C++ 版 qpc_now_us() と同じ）
 
 2. Stopwatch パス（Stopwatch.IsHighResolution == true）
    Stopwatch.GetTimestamp() * _tickToUs
@@ -194,20 +200,36 @@ P/Invoke なし。Win32 分岐はすべてコンパイル除外。
 ```
 if _tTimer != IntPtr.Zero → キャッシュ済みハンドルを返す
 
-_createWaitableTimerExState の確認:
-  >= 0 → CreateWaitableTimerEx を試みる
-  < 0  → CreateWaitableTimerEx は使用不可（EntryPointNotFoundException を過去に捕捉済み）
-
-1. CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
-   成功 → _tTimer に保存し、_createWaitableTimerExState = 1
-
-2. 失敗 → CreateWaitableTimerEx(NULL, NULL, 0, TIMER_ALL_ACCESS)（フラグなし）
-
-3. EntryPointNotFoundException 捕捉 → _createWaitableTimerExState = -1
+HasHighResolutionTimer()（プロセス全体で 1 回だけ判定・下記 5.2.1）:
+  true  → CreateWaitableTimerEx(NULL, NULL, HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+          （判定処理がこのスレッドのハンドルを既に確保していればそれを返す）
+          成功 → _tTimer に保存して返す
+  false → HR タイマーは使えない
 
 最終フォールバック:
-   _tTimer == IntPtr.Zero → CreateWaitableTimer(NULL, false, NULL)
+   CreateWaitableTimer(NULL, false, NULL) を _tTimer に保存して返す
+   ※ ここでプロセス全体の _hrTimerState を書き換えてはならない（スコープが違う）
 ```
+
+#### 5.2.1 `HasHighResolutionTimer()`
+
+高分解能 WaitableTimer の可用性を **プロセス全体で一度だけ** 確定させる。
+状態は `_hrTimerState`（`-1` = 利用不可 / `0` = 未判定 / `1` = 利用可）。
+
+```
+_hrTimerState != 0 → 確定済みの結果を返す
+_isWin == false    → -1 を書いて false
+
+CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+  成功 → 試作したハンドルは捨てず、このスレッドの _tTimer が空なら流用（埋まっていれば CloseHandle）
+         _hrTimerState = 1
+  失敗 / EntryPointNotFoundException → _hrTimerState = -1
+```
+
+競合しても複数スレッドが同じ判定を行うだけで結果は同一なのでロックは不要。
+旧実装は `GetTimer()` が呼ばれるまで可用性が確定せず、「まだ長い待機をしていない
+スレッド」では HR タイマー経路に入れなかった。この判定は
+`SleepMicroseconds()` の分岐条件（6.1 節の `canHr`）からも参照される。
 
 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`（`0x00000002`）は Windows 10 バージョン 1803（RS4）以降で利用可能。このフラグにより、タイマーの待機精度が向上する。
 
@@ -236,10 +258,14 @@ usec == 0 → CoarseYield(SWITCH_THREAD) して return
   LOW_POWER: timerFirstUs=1000, preferSpinBelow=0
   BALANCED:  timerFirstUs=2000, preferSpinBelow=200
 
-if (usec >= timerFirstUs) OR (usec > preferSpinBelow):
+canHr = HasHighResolutionTimer()
+
+if (usec >= timerFirstUs) OR (canHr AND usec > preferSpinBelow):
     SleepByTimer(usec, tailSpinUs, policy, lowPower)
 else:
-    SpinWithPeriodicYield(NowUs() + usec, tailSpinUs, policy)
+    SpinWithPeriodicYield(DeadlineFromNow(usec),
+                          lowPower ? 0 : tailSpinUs,
+                          lowPower ? SLEEP1 : policy)
 ```
 
 **判定の意図:**
@@ -247,10 +273,19 @@ else:
 - `usec >= timerFirstUs`：十分長ければ純タイマー待機（スピン区間より長い）
 - それ以下の短い待機：純スピンでオーバーヘッドを避ける
 
+**`canHr` 項**（C++ 版 `do_sleep_us()` の同名項に対応）: `preferSpinBelow` 側の
+条件は高分解能タイマーが実際に使えるときだけ成立させる。この項が無いと
+`preferSpinBelow == 0` の LOW_POWER が常にタイマー経路へ吸われ、HR タイマーの
+無い環境向けの `SLEEP1` スピン経路（else 側）が到達不能になっていた。
+
+**`DeadlineFromNow(usec)`**: `NowUs() + usec` を素で足すとラップアラウンドして
+「deadline はもう過ぎている」と誤判定し即座に返ってしまうため、
+`ulong.MaxValue` で飽和させる。
+
 ### 6.2 `SleepByTimer(usec, tailSpinUs, policy, lowPower)` フロー
 
 ```
-targetUs = NowUs() + usec
+targetUs = DeadlineFromNow(usec)   // ulong.MaxValue で飽和
 h = GetTimer()
 
 if h != IntPtr.Zero:
@@ -268,13 +303,19 @@ if h != IntPtr.Zero:
 
 // タイマー取得失敗または SetWaitableTimer 失敗
 if usec >= 1000:
-    Sleep(usec / 1000)  // ms 単位切り捨て
+    Sleep(min(usec / 1000, uint.MaxValue))  // ms 単位切り捨て
     tYieldSleep1++
-    if tailSpinUs > 0: SpinWithPeriodicYield(targetUs, ...)
+    SpinWithPeriodicYield(targetUs, 0, NONE)  // tailSpinUs に関わらず必ず詰める
     return
 
 SpinWithPeriodicYield(targetUs, tailSpinUs, policy)
 ```
+
+`Sleep(ms)` は `usec` を ms へ切り捨てた値でしか眠らないため、最大 999 µs 不足しうる。
+そのため `tailSpinUs` の値に関わらず必ず `targetUs` まで詰める。以前はここが
+`if (tailSpinUs > 0)` だったので、`tailSpinUs == 0` の LOW_POWER でタイマーが
+使えない場合に最大 999 µs 早く返る契約違反があった。詰める残りは定義上 1 ms 未満に
+収まり、`Sleep(ms)` は実際にはほぼ必ずオーバーシュートするため通常 0 回転で抜ける。
 
 ### 6.3 `SpinWithPeriodicYield(targetUs, tailSpinUs, policy)` フロー
 
@@ -393,7 +434,7 @@ JIT コンパイラによるループ最適化・インライン展開を促し�
 | `_isWin` | `bool` | Windows 環境かどうか（起動時に確定） |
 | `_hires` | `bool` | `Stopwatch.IsHighResolution` |
 | `_tickToUs` | `double` | Stopwatch tick → µs 変換係数 |
-| `_createWaitableTimerExState` | `int` | `CreateWaitableTimerEx` の利用可能性（0: 未確認、1: 成功、-1: 不可） |
+| `_hrTimerState` | `int` | 高分解能 WaitableTimer の可用性（0: 未判定、1: 利用可、-1: 利用不可）。プロセス全体で 1 回だけ確定 |
 
 ---
 
@@ -472,7 +513,7 @@ Unity 向けでは `USLP_X64_ONLY` は通常指定しない（マルチプラッ
 - **例外の内部捕捉**: `EntryPointNotFoundException` は `GetTimer()` 内で捕捉済み。呼び出し元への漏洩なし
 - **タイマーハンドルの共有なし**: `[ThreadStatic]` により各スレッドが独立したハンドルを保持
 - **タイマー分解能の重複設定防止**: `_timerResolutionLock` による排他制御で `timeBeginPeriod` の二重呼び出しを防止
-- **整数オーバーフロー（Unity/USLP_WINDOWS）**: `NowUs()` の QPC 計算 `c.QuadPart * 1_000_000L / _qpcFreq` は `long` 演算。QPC カウンタが `long.MaxValue / 1_000_000` を超えるのは数千年後であり実用上問題なし。NuGet ビルド（`USLP_GENERATOR`）では `Stopwatch.GetTimestamp() * _tickToUs`（浮動小数点乗算）を使用するため同様に整数オーバーフローは発生しない
+- **整数オーバーフロー（Unity/USLP_WINDOWS）**: `NowUs()` の QPC 計算はかつて `c.QuadPart * 1_000_000L / _qpcFreq` と書かれており、乗算が先に来るため `long` がオーバーフローした。QPC 10 MHz の環境ではブートから約 **10.7 日**（`long.MaxValue / 1_000_000 / 10_000_000` 秒）で時刻が巻き戻る実バグだった。現在は商と剰余に分けた純整数演算 + 飽和に修正済み（3.2 節）。NuGet ビルド（`USLP_GENERATOR`）では `Stopwatch.GetTimestamp() * _tickToUs`（浮動小数点乗算）を使用するため整数オーバーフローは発生しない
 - **テスト用の内部可視化**: `USLP_GENERATOR` ビルドのみ、`src/AssemblyAttributes.cs` で `[assembly: InternalsVisibleTo("UsleepWin.Tests")]` を宣言している。`TimerWheel` / `PreciseWaitItem` は `internal` のままだが、境界条件（過去 deadline の大量投入、ホイール範囲外の deadline）は `PreciseDelay` 越しの結合テストでは再現できないため、テストアセンブリから直接操作できるようにしている。公開 API の可視性には影響しない
 
 ---
@@ -619,7 +660,7 @@ WaitableTimer HR パスでは `ThreadPool.RegisterWaitForSingleObject` を使用
 段階的に劣化する。「例外を投げずに劣化させる」という方針は同期側
 `InternalTiming.SleepByTimer()`（6.2 節）と共有するが、**劣化の段は同一ではない**。
 同期側が持つ非 Ex 版 `CreateWaitableTimer` への降格段と、失敗をプロセス単位で
-memoize する仕組み（`_createWaitableTimerExState`）は本メソッドには無い。
+memoize する仕組み（`_hrTimerState`）は本メソッドには無い。
 `CreateWaitableTimerExW` は Windows 8 以降に存在し、このファイルがコンパイルされる
 唯一のバリアントは `net10.0-windows`（最低要件 Windows 10 1607）なので
 `EntryPointNotFoundException` 経路が実質到達不能であり、そのために静的状態を
@@ -704,11 +745,19 @@ SetWaitableTimer(handle, ...) が FALSE を返した場合も
 | 操作 | 条件 | 例外 |
 | --- | --- | --- |
 | `Initialize(cpuCore)` | `cpuCore == 0` | `ArgumentException` |
+| `Initialize(cpuCore)` | `cpuCore >= Environment.ProcessorCount` | `ArgumentOutOfRangeException` |
+| `Initialize(cpuCore)` | `cpuCore >= IntPtr.Size * 8` | `ArgumentOutOfRangeException` |
 | `Initialize(cpuCore)` | 既に初期化済み | `InvalidOperationException` |
 | `WaitAsync(...)` | 未初期化 / Shutdown 後 | `InvalidOperationException` |
 | `WaitAsync(..., ct)` | `ct` が既にキャンセル済み | `OperationCanceledException` |
 
 `Initialize()` 内では `SpinCoreEngine` の一時変数に代入してから `Initialize()` を呼び、成功した場合のみ `_engine` フィールドに代入する（例外時に `IsInitialized` が `true` になるバグを防止）。
+
+`cpuCore` は 1 プロセッサグループ（= ポインタ幅ぶんのビット）に収まる範囲でしか指定できない。
+`SetThreadAffinityMask` のマスクがポインタ幅しか表現できず、これを超えるコア番号は
+シフトが未定義になって意図しないコアへ固定されるため（旧実装の `1u << core` は
+32 コア以上で既に破綻していた）。64 コア超への固定には `SetThreadGroupAffinity` が
+必要だが、本ライブラリでは扱わない。
 
 `SpinCoreEngine.Dispose()` は `_running = false` を立てたのち、スピンスレッドの
 `Thread.Join(TimeSpan.FromSeconds(1))` が **成功したときだけ** `TimerWheel.Dispose()` を

@@ -150,7 +150,14 @@ thread (`SpinCoreEngine`) or any other thread.
 
 1. QPC path (_isWin == true, _qpcFreq > 0)
    QueryPerformanceCounter(out c)
-   → (ulong)(c.QuadPart * 1_000_000L / _qpcFreq)
+   → ticks = (ulong)c.QuadPart, f = (ulong)_qpcFreq
+     q = ticks / f, r = ticks % f
+     q > ulong.MaxValue / 1_000_000 → ulong.MaxValue (saturate)
+     baseUs = q * 1_000_000, remUs = (r * 1_000_000) / f
+     baseUs > ulong.MaxValue - remUs → ulong.MaxValue (saturate)
+     → baseUs + remUs
+   (pure integer math split into quotient and remainder, matching the
+    C++ qpc_now_us())
 
 2. Stopwatch path (Stopwatch.IsHighResolution == true)
    Stopwatch.GetTimestamp() * _tickToUs
@@ -199,20 +206,37 @@ OS; measured results vary with scheduler, power management, and virtualization.
 ```
 if _tTimer != IntPtr.Zero → return cached handle
 
-Check _createWaitableTimerExState:
-  >= 0 → attempt CreateWaitableTimerEx
-  <  0 → CreateWaitableTimerEx unavailable (EntryPointNotFoundException caught previously)
-
-1. CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
-   success → store in _tTimer; set _createWaitableTimerExState = 1
-
-2. fail → CreateWaitableTimerEx(NULL, NULL, 0, TIMER_ALL_ACCESS) (no flag)
-
-3. EntryPointNotFoundException caught → set _createWaitableTimerExState = -1
+HasHighResolutionTimer() (decided once per process, see 5.2.1):
+  true  → CreateWaitableTimerEx(NULL, NULL, HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+          (if the probe already claimed a handle for this thread, return that)
+          success → store in _tTimer and return it
+  false → the HR timer is unavailable
 
 Final fallback:
-   _tTimer == IntPtr.Zero → CreateWaitableTimer(NULL, false, NULL)
+   store CreateWaitableTimer(NULL, false, NULL) in _tTimer and return it
+   NOTE: never write the process-wide _hrTimerState here (different scope)
 ```
+
+#### 5.2.1 `HasHighResolutionTimer()`
+
+Decides high-resolution WaitableTimer availability **once per process**.
+State lives in `_hrTimerState` (`-1` = unavailable / `0` = undecided / `1` = available).
+
+```
+_hrTimerState != 0 → return the decided result
+_isWin == false    → write -1 and return false
+
+CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+  success → keep the probe handle: reuse it as this thread's _tTimer when empty,
+            otherwise CloseHandle it; set _hrTimerState = 1
+  failure / EntryPointNotFoundException → set _hrTimerState = -1
+```
+
+No lock is needed: a race just makes several threads perform the same probe with
+the same outcome. The old implementation only decided availability once
+`GetTimer()` ran, so a thread that had not yet performed a long wait could never
+enter the HR timer path. This probe is also consulted by the branch condition in
+`SleepMicroseconds()` (`canHr`, section 6.1).
 
 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (`0x00000002`) is available from Windows 10 version 1803 (RS4) onward. This flag improves timer wake-up accuracy.
 
@@ -241,10 +265,14 @@ Determine profile-specific thresholds:
   LOW_POWER: timerFirstUs=1000, preferSpinBelow=0
   BALANCED:  timerFirstUs=2000, preferSpinBelow=200
 
-if (usec >= timerFirstUs) OR (usec > preferSpinBelow):
+canHr = HasHighResolutionTimer()
+
+if (usec >= timerFirstUs) OR (canHr AND usec > preferSpinBelow):
     SleepByTimer(usec, tailSpinUs, policy, lowPower)
 else:
-    SpinWithPeriodicYield(NowUs() + usec, tailSpinUs, policy)
+    SpinWithPeriodicYield(DeadlineFromNow(usec),
+                          lowPower ? 0 : tailSpinUs,
+                          lowPower ? SLEEP1 : policy)
 ```
 
 **Rationale:**
@@ -252,10 +280,21 @@ else:
 - `usec >= timerFirstUs`: long enough for a pure timer wait (longer than the spin tail)
 - Shorter waits: pure spin to minimize scheduling overhead
 
+**The `canHr` term** (mirrors the term of the same name in the C++
+`do_sleep_us()`): the `preferSpinBelow` condition may only fire when a
+high-resolution timer is actually available. Without it, LOW_POWER — whose
+`preferSpinBelow` is 0 — was always pulled into the timer path, making the
+`SLEEP1` spin path in the `else` branch (intended for machines without an HR
+timer) unreachable.
+
+**`DeadlineFromNow(usec)`**: a plain `NowUs() + usec` wraps around and is then
+read as "the deadline has already passed", returning immediately. The deadline
+saturates at `ulong.MaxValue` instead.
+
 ### 6.2 `SleepByTimer(usec, tailSpinUs, policy, lowPower)` Flow
 
 ```
-targetUs = NowUs() + usec
+targetUs = DeadlineFromNow(usec)   // saturates at ulong.MaxValue
 h = GetTimer()
 
 if h != IntPtr.Zero:
@@ -273,13 +312,21 @@ if h != IntPtr.Zero:
 
 // Timer handle unavailable or SetWaitableTimer failed
 if usec >= 1000:
-    Sleep(usec / 1000)  // truncated to ms
+    Sleep(min(usec / 1000, uint.MaxValue))  // truncated to ms
     tYieldSleep1++
-    if tailSpinUs > 0: SpinWithPeriodicYield(targetUs, ...)
+    SpinWithPeriodicYield(targetUs, 0, NONE)  // always top up, regardless of tailSpinUs
     return
 
 SpinWithPeriodicYield(targetUs, tailSpinUs, policy)
 ```
+
+`Sleep(ms)` only sleeps for `usec` truncated to whole milliseconds, so it can
+fall short by up to 999 µs. The target is therefore always topped up regardless
+of `tailSpinUs`. This used to read `if (tailSpinUs > 0)`, which meant LOW_POWER
+(`tailSpinUs == 0`) combined with an unavailable timer returned up to 999 µs
+early — a contract violation. The remaining gap is by definition under 1 ms, and
+`Sleep(ms)` almost always overshoots in practice, so the loop normally exits
+without a single iteration.
 
 ### 6.3 `SpinWithPeriodicYield(targetUs, tailSpinUs, policy)` Flow
 
@@ -399,7 +446,7 @@ The following fields are all `[ThreadStatic]`. Each thread holds its own indepen
 | `_isWin` | `bool` | Whether running on Windows (determined at startup) |
 | `_hires` | `bool` | `Stopwatch.IsHighResolution` |
 | `_tickToUs` | `double` | Stopwatch tick-to-µs conversion coefficient |
-| `_createWaitableTimerExState` | `int` | `CreateWaitableTimerEx` availability (0: unknown, 1: available, -1: unavailable) |
+| `_hrTimerState` | `int` | High-resolution WaitableTimer availability (0: undecided, 1: available, -1: unavailable). Decided once per process |
 
 ---
 
@@ -478,7 +525,7 @@ Passing `reset: true` to `GetStats()` atomically retrieves and zeros all counter
 - **Internal exception handling**: `EntryPointNotFoundException` is caught inside `GetTimer()` and does not propagate to callers.
 - **No cross-thread handle sharing**: `[ThreadStatic]` ensures each thread owns its timer handle exclusively.
 - **Timer resolution double-call prevention**: `_timerResolutionLock` serializes `timeBeginPeriod` calls, preventing race conditions.
-- **Integer overflow in `NowUs()` (Unity / `USLP_WINDOWS`)**: The QPC calculation `c.QuadPart * 1_000_000L / _qpcFreq` uses `long` arithmetic. The QPC counter would not reach `long.MaxValue / 1_000_000` for thousands of years, making overflow a non-issue in practice. In NuGet builds (`USLP_GENERATOR`), `Stopwatch.GetTimestamp() * _tickToUs` (floating-point multiplication) is used instead, so integer overflow likewise does not apply.
+- **Integer overflow in `NowUs()` (Unity / `USLP_WINDOWS`)**: The QPC calculation used to be written as `c.QuadPart * 1_000_000L / _qpcFreq`, where the multiplication happens first and overflows `long`. On a 10 MHz QPC this wrapped roughly **10.7 days** after boot (`long.MaxValue / 1_000_000 / 10_000_000` seconds), making time run backwards — a real bug, not a theoretical one. It is now computed with saturating pure-integer math split into quotient and remainder (section 3.2). In NuGet builds (`USLP_GENERATOR`), `Stopwatch.GetTimestamp() * _tickToUs` (floating-point multiplication) is used instead, so integer overflow does not apply there.
 - **Internal visibility for tests**: In `USLP_GENERATOR` builds only, `src/AssemblyAttributes.cs` declares `[assembly: InternalsVisibleTo("UsleepWin.Tests")]`. `TimerWheel` and `PreciseWaitItem` remain `internal`, but boundary conditions (large bursts of past deadlines, deadlines beyond the wheel's representable range) cannot be reproduced through integration tests that go through `PreciseDelay`, so the test assembly is given direct access. This does not affect the visibility of any public API.
 
 ---
@@ -641,7 +688,7 @@ it degrades in stages, in the following order. The policy of "degrade without
 throwing" is shared with the synchronous side's `InternalTiming.SleepByTimer()`
 (section 6.2), but **the stages themselves are not identical**. The synchronous
 side's fallback to the non-Ex `CreateWaitableTimer`, and its process-wide memoization
-of failures (`_createWaitableTimerExState`), have no counterpart here.
+of failures (`_hrTimerState`), have no counterpart here.
 `CreateWaitableTimerExW` has existed since Windows 8, and the only variant in which
 this file is compiled is `net10.0-windows` (minimum requirement Windows 10 1607), so
 the `EntryPointNotFoundException` path is effectively unreachable — which is why
@@ -734,11 +781,19 @@ because cancellation carries `ct`.
 | Operation | Condition | Exception |
 | --- | --- | --- |
 | `Initialize(cpuCore)` | `cpuCore == 0` | `ArgumentException` |
+| `Initialize(cpuCore)` | `cpuCore >= Environment.ProcessorCount` | `ArgumentOutOfRangeException` |
+| `Initialize(cpuCore)` | `cpuCore >= IntPtr.Size * 8` | `ArgumentOutOfRangeException` |
 | `Initialize(cpuCore)` | Already initialized | `InvalidOperationException` |
 | `WaitAsync(...)` | Not initialized / after Shutdown | `InvalidOperationException` |
 | `WaitAsync(..., ct)` | `ct` already cancelled | `OperationCanceledException` |
 
 Inside `Initialize()`, a temporary variable is used for the `SpinCoreEngine` instance; it is assigned to `_engine` only after `Initialize()` succeeds. This prevents `IsInitialized` from being `true` after a failed initialization.
+
+`cpuCore` must fit within a single processor group (i.e. the pointer width in
+bits). `SetThreadAffinityMask` takes a pointer-width mask, so a higher core index
+makes the shift undefined and pins the thread to an unintended core — the old
+`1u << core` was already broken at 32 cores and above. Pinning beyond 64 cores
+requires `SetThreadGroupAffinity`, which this library does not handle.
 
 `SpinCoreEngine.Dispose()` sets `_running = false` and then calls
 `TimerWheel.Dispose()` **only if** `Thread.Join(TimeSpan.FromSeconds(1))` on the spin

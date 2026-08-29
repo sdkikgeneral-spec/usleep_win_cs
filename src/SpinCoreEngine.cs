@@ -40,6 +40,13 @@ internal sealed class SpinCoreEngine : IDisposable
         if (cpuCore == 0)
             throw new ArgumentException(
                 "コア0はOSが予約しているため使用できません", nameof(cpuCore));
+        // SetThreadAffinityMask のマスクはポインタ幅（= 1 プロセッサグループ分）しか
+        // 表現できない。これを超えるコア番号はシフトが未定義になり、意図しないコアへ
+        // 固定される（旧実装は 1u << core で 32 コア以上が既に破綻していた）。
+        // 64 コア超への固定には SetThreadGroupAffinity が必要で、ここでは扱わない。
+        if (cpuCore >= IntPtr.Size * 8)
+            throw new ArgumentOutOfRangeException(nameof(cpuCore),
+                $"コア番号は 1〜{IntPtr.Size * 8 - 1} の範囲（1 プロセッサグループ分）で指定してください");
         if (Process.GetCurrentProcess().PriorityClass == ProcessPriorityClass.RealTime)
             throw new SecurityException(
                 "RealTime優先度クラスでの実行は禁止されています");
@@ -74,7 +81,9 @@ internal sealed class SpinCoreEngine : IDisposable
         int core = (int)coreObj!;
 
         // P/Invoke はここだけ（ホットパスでは一切呼ばない）
-        SetThreadAffinityMask(GetCurrentThread(), new UIntPtr(1u << core));
+        // nuint でシフトする（32bit の 1u << core だと 32 コア以上で破綻する）。
+        // core < IntPtr.Size*8 は Initialize() で検証済み。
+        SetThreadAffinityMask(GetCurrentThread(), (UIntPtr)((nuint)1 << core));
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         NtSetTimerResolution(1, true, out _);
 

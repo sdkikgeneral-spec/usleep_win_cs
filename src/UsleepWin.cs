@@ -38,7 +38,7 @@ namespace Usleep.Win
         {
             if (usec == 0) { CoarseYield(UsleepYieldPolicy.SWITCH_THREAD); return; }
 
-            long timerFirstUs, preferSpinBelow;
+            ulong timerFirstUs, preferSpinBelow;
             switch (_profile)
             {
                 case UsleepProfile.STRICT:    timerFirstUs = 1500; preferSpinBelow = 500; break;
@@ -47,10 +47,16 @@ namespace Usleep.Win
             }
 
             bool lowPower = (_profile == UsleepProfile.LOW_POWER);
-            if ((long)usec >= timerFirstUs || (long)usec > preferSpinBelow)
-                SleepByTimer((long)usec, _tailSpinUs, _yieldPolicy, lowPower);
+
+            // preferSpinBelow 側の条件は「高分解能タイマーが実際に使えるとき」だけ成立させる
+            // （C++ 版 do_sleep_us() の can_hr 項）。この項が無いと preferSpinBelow==0 の
+            // LOW_POWER が常にタイマー経路へ吸われ、HR タイマーが無い環境向けの
+            // SLEEP1 スピン経路（下の else）が到達不能になる。
+            bool canHr = HasHighResolutionTimer();
+            if (usec >= timerFirstUs || (canHr && usec > preferSpinBelow))
+                SleepByTimer(usec, _tailSpinUs, _yieldPolicy, lowPower);
             else
-                SpinWithPeriodicYield(NowUs() + usec, lowPower ? 0U : _tailSpinUs,
+                SpinWithPeriodicYield(DeadlineFromNow(usec), lowPower ? 0U : _tailSpinUs,
                                       lowPower ? UsleepYieldPolicy.SLEEP1 : _yieldPolicy);
         }
 
