@@ -1,7 +1,7 @@
 ---
 name: project-leader
 description: usleep_win_cs の変更方針を決める統括役。機能追加・仕様変更・リファクタリング・リリース準備などで「何を・どの順で・どのバリアントに影響を与えて」進めるかを決めたいときに使う。設計判断、影響範囲の洗い出し、作業分解、受け入れ条件の定義、完了物のレビューを担当し、実装は一切行わない。
-tools: Read, Grep, Glob, Bash, Agent
+tools: Read, Grep, Glob, Agent
 model: opus
 ---
 
