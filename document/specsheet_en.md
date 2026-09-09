@@ -63,8 +63,8 @@ All Win32 API calls are excluded at compile time. `Platform.IsWindows` always re
 | Target | Constants Defined |
 |---|---|
 | NuGet (`net10.0-windows`) | `USLP_WINDOWS` + `USLP_NUGET` + `USLP_GENERATOR` |
-| Unity Windows-only DLL | `USLP_WINDOWS` |
-| Unity Generic DLL | (none) |
+| Unity Windows-only DLL | `USLP_UNITY` + `USLP_WINDOWS` |
+| Unity Generic DLL | `USLP_UNITY` |
 
 ---
 

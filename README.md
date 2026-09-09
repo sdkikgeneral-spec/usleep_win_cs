@@ -6,7 +6,7 @@ maintained as a supporting utility within a broader cross-platform and education
 # usleep_win_cs
 
 [![NuGet](https://img.shields.io/nuget/v/usleep_win_cs)](https://www.nuget.org/packages/usleep_win_cs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/LICENSE)
 
 **高精度・低ジッタな Windows 向けマイクロ秒スリープライブラリ（pure C#）**
 
@@ -27,9 +27,16 @@ maintained as a supporting utility within a broader cross-platform and education
 
 ## インストール
 
+対象は **`net10.0-windows`（Windows 専用）** の NuGet パッケージです。
+
 ```shell
 dotnet add package usleep_win_cs
 ```
+
+Unity プロジェクトへの組み込みには NuGet パッケージではなく、
+[GitHub Releases](https://github.com/sdkikgeneral-spec/usleep_win_cs/releases) が配布する
+zip から Unity Windows / Unity Generic 向けの DLL を取得して `Assets` 配下に配置してください
+（Unity 汎用 DLL は `netstandard2.1`、P/Invoke なし）。
 
 ---
 
@@ -92,7 +99,7 @@ PreciseDelay.Shutdown();
 > 専用スピンスレッド上でインライン実行されうる。`await` の直後でブロッキング処理
 > （`lock`、ファイル / ネットワーク I/O、同期待ち、重いロギング）を行うと、
 > 同時に待機している他の待機項目の精度が損なわれる。重い処理は `Task.Run` などへ逃がすこと。
-> 詳細は [`document/specsheet.md`](document/specsheet.md) の 14.3 節を参照。
+> 詳細は [`document/specsheet.md`](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/document/specsheet.md) の 14.3 節を参照。
 
 ---
 
@@ -145,7 +152,7 @@ PreciseDelay.Shutdown();
 
 ## ライセンス
 
-MIT License — 詳細は [LICENSE](./LICENSE) を参照してください。
+MIT License — 詳細は [LICENSE](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/LICENSE) を参照してください。
 
 ---
 ---
@@ -155,7 +162,7 @@ MIT License — 詳細は [LICENSE](./LICENSE) を参照してください。
 # English
 
 [![NuGet](https://img.shields.io/nuget/v/usleep_win_cs)](https://www.nuget.org/packages/usleep_win_cs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/LICENSE)
 
 **High-accuracy, low-jitter microsecond sleep for Windows — pure C#, .NET 10+**
 
@@ -174,9 +181,16 @@ MIT License — 詳細は [LICENSE](./LICENSE) を参照してください。
 
 ## Installation
 
+This targets the **`net10.0-windows`, Windows-only** NuGet package.
+
 ```shell
 dotnet add package usleep_win_cs
 ```
+
+For Unity projects, do not use the NuGet package. Instead, get the Unity Windows /
+Unity Generic DLL from the zip published on
+[GitHub Releases](https://github.com/sdkikgeneral-spec/usleep_win_cs/releases) and drop it
+into `Assets` (the Unity Generic DLL targets `netstandard2.1` with no P/Invoke).
 
 ---
 
@@ -239,7 +253,7 @@ PreciseDelay.Shutdown();
 > may run inline on the dedicated spin thread. Blocking right after the `await`
 > (`lock`, file/network I/O, synchronous waits, heavy logging) degrades the accuracy of
 > every other wait pending at that moment. Move heavy work off with `Task.Run` or similar.
-> See section 14.3 of [`document/specsheet_en.md`](document/specsheet_en.md) for details.
+> See section 14.3 of [`document/specsheet_en.md`](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/document/specsheet_en.md) for details.
 
 ---
 
@@ -292,7 +306,7 @@ PreciseDelay.Shutdown();
 
 ## License
 
-MIT License — see [LICENSE](./LICENSE) for details.
+MIT License — see [LICENSE](https://github.com/sdkikgeneral-spec/usleep_win_cs/blob/main/LICENSE) for details.
 
 ---
 

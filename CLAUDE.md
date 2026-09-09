@@ -67,8 +67,12 @@ dotnet test tests\UsleepWin.UnityWindows.Tests\UsleepWin.UnityWindows.Tests.cspr
 | ターゲット | TFM | 定義される定数 |
 |---|---|---|
 | NuGet | `net10.0-windows` | `USLP_WINDOWS` + `USLP_NUGET` + `USLP_GENERATOR`（+ 任意で `USLP_X64_ONLY`） |
-| Unity Windows | `netstandard2.1` | `USLP_WINDOWS` のみ |
-| Unity Generic | `netstandard2.1` | `USLP_UNITY`（Win32 分岐は全除外） |
+| Unity Windows | `netstandard2.1` | `USLP_UNITY` + `USLP_WINDOWS` |
+| Unity Generic | `netstandard2.1` | `USLP_UNITY` のみ（Win32 分岐は全除外） |
+
+Unity Windows と Unity Generic はどちらも `USLP_UNITY` を持つため `PreciseDelay` 系は同様に
+除外される。両者の差は `USLP_WINDOWS` の有無、すなわち `DllImport` 版 P/Invoke と QPC 経路
+（Win32 分岐）が入るかどうかだけである。
 
 - `USLP_GENERATOR` … `LibraryImport` source generator、`AggressiveOptimization`、`SkipLocalsInit` を有効化
 - `USLP_WINDOWS` … 従来の `DllImport` + `SuppressUnmanagedCodeSecurity`
@@ -100,7 +104,7 @@ PreciseDelay (public API)
   ├─ >5ms → WaitableTimer HR + RegisterWaitForSingleObject（省電力フォールバック）
   └─ ≤5ms → SpinCoreEngine
                ├─ 専用スピンスレッド（コア固定 + TIME_CRITICAL + NtSetTimerResolution(1)）
-               ├─ TimerWheel   … 4096 スロット、Math.BigMul のマジックナンバー除算で O(1)
+               ├─ TimerWheel   … 8192 スロット、素直な long 除算で O(1)
                └─ PreciseWaitItem(Pool) … IValueTaskSource でゼロアロケーション
 ```
 

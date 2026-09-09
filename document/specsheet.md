@@ -63,8 +63,8 @@
 | ターゲット | 実際に定義される定数 |
 |---|---|
 | NuGet（net10.0-windows） | `USLP_WINDOWS` + `USLP_NUGET` + `USLP_GENERATOR` |
-| Unity Windows-only DLL | `USLP_WINDOWS` |
-| Unity Generic DLL | （なし）|
+| Unity Windows-only DLL | `USLP_UNITY` + `USLP_WINDOWS` |
+| Unity Generic DLL | `USLP_UNITY` |
 
 ---
 

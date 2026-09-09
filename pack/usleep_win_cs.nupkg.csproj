@@ -6,18 +6,36 @@
 
     <PackageId>usleep_win_cs</PackageId>
     <Title>usleep_win_cs</Title>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Authors>usleep_win_cs contributors</Authors>
     <Company>usleep_win_cs contributors</Company>
     <Description>High-accuracy, low-jitter microsecond sleep for Windows (WaitableTimer + QPC + Yield). .NET 10+ (Windows).</Description>
     <PackageTags>usleep;windows;timer;qpc;yield;low-jitter;realtime</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageProjectUrl>https://github.com/sdkikgeneral-spec/usleep_win_cs</PackageProjectUrl>
     <RepositoryUrl>https://github.com/sdkikgeneral-spec/usleep_win_cs</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>0.2.1
+- Cancellation exceptions thrown from the spin path now carry the caller's CancellationToken, so `e.CancellationToken` is consistent regardless of the requested delay.
+- Fixed a handle leak and a missing wait-handle unregistration in the asynchronous WaitableTimer path.
+- Fixed integer overflow in the timestamp/deadline arithmetic and added a three-stage fallback for WaitableTimer creation.
+- Added `UsleepWin.MaxTailSpinMicroseconds` and enforced it as the upper bound for the tail-spin setting.</PackageReleaseNotes>
 
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- ── ソースリンク ──
+         .NET 8 SDK 以降 Microsoft.SourceLink.GitHub は SDK に組み込まれており、
+         PackageReference は不要（生成済み PDB に raw.githubusercontent.com の
+         マップが入ることを確認済み）。ここでは付随プロパティのみ設定する。 -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- DeterministicSourcePaths はローカルデバッグを壊すため CI ビルドでのみ有効化する。
+         ContinuousIntegrationBuild=true が DeterministicSourcePaths を引き起こす。 -->
+    <ContinuousIntegrationBuild Condition="'$(ContinuousIntegrationBuild)' == '' AND '$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
     <IsPackable>true</IsPackable>
     <SupportedOSPlatform>Windows</SupportedOSPlatform>
