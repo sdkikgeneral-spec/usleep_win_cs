@@ -190,8 +190,13 @@ public static class PreciseDelay
 
             // 呼び出し側の `when (e.CancellationToken == ct)` が機能するよう
             // トークン付きでキャンセルする。state はタプルで渡しクロージャを避ける。
-            // なおこれは >5ms の WaitableTimer 経路だけの性質で、API 全体の保証ではない。
-            // ≤5ms のスピン経路は PreciseWaitItem 側がトークン無しでキャンセルする。
+            // トークンを載せるのは両経路共通の振る舞いで、≤5ms のスピン経路では
+            // PreciseWaitItem.CompleteAsCancelled() が同じくトークン付きでキャンセルする。
+            // ただし応答性は非対称。この >5ms 経路は ct.Register → TrySetCanceled で
+            // 即座にキャンセルが返るが、スピン経路のキャンセル検査は TimerWheel の
+            // CompleteSlot() / Enqueue() の完了判定時にしか行われないため、例外が出るのは
+            // 要求した delay（≤5ms）ぶんが経過した後で、キャンセルで待機が早期に
+            // 打ち切られるわけではない（上限側の遅れ幅は保証しない）。
             await using (ct.Register(
                 static s =>
                 {

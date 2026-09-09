@@ -19,6 +19,12 @@ namespace Usleep.Win;
 internal sealed class PreciseWaitItem
     : IValueTaskSource, IPooledObjectPolicy<PreciseWaitItem>
 {
+    // _vtsc.RunContinuationsAsynchronously は意図的に設定しない（既定の false のまま）。
+    // true にすると継続が ThreadPool 経由になり、WaitAsync_500us_AverageErrorWithin50us の
+    // 平均誤差が実測で約 3µs から約 24µs へ悪化し、PreciseDelay が掲げる ±1〜3µs を損なう。
+    // 代償として await 以降の継続はスピンスレッド上でインライン実行されうるため、
+    // 呼び出し側は継続でブロッキング処理（lock / I/O / 同期待ち）をしてはならない。
+    // この制約は document/specsheet.md に記載。
     private ManualResetValueTaskSourceCore<bool> _vtsc;
 
     public CancellationToken CancellationToken { get; private set; }
@@ -48,13 +54,17 @@ internal sealed class PreciseWaitItem
         _vtsc.SetResult(true);
     }
 
+    // 待機を依頼したトークンを例外に載せ、呼び出し側の
+    // `catch (OperationCanceledException e) when (e.CancellationToken == ct)` を成立させる。
+    // 実引数は SetException 呼び出し前に評価されるため、継続 → GetResult → プール返却より
+    // 厳密に先にトークンを読み終えている（別の待機で上書きされる余地がない）。
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void CompleteAsCancelled()
     {
         Debug.Assert(IsInitialized,
             "未初期化の PreciseWaitItem への Cancel 呼び出し");
         IsInitialized = false;
-        _vtsc.SetException(new OperationCanceledException());
+        _vtsc.SetException(new OperationCanceledException(CancellationToken));
     }
 
     // IValueTaskSource
@@ -78,6 +88,8 @@ internal sealed class PreciseWaitItem
         => _vtsc.OnCompleted(continuation, state, token, flags);
 
     // IPooledObjectPolicy
+    // 注意: ポリシー引数なしの ObjectPoolProvider.Create<T>() は DefaultPooledObjectPolicy<T>
+    // を生成して使う仕様のため、この Create() / Return() は呼ばれない（別課題として残す）。
     public PreciseWaitItem Create() => new();
     public bool Return(PreciseWaitItem obj)
     {

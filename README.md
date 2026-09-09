@@ -88,6 +88,12 @@ await PreciseDelay.WaitAsync(TimeSpan.FromMicroseconds(500), cancellationToken);
 PreciseDelay.Shutdown();
 ```
 
+> **注意:** `await PreciseDelay.WaitAsync(...)` 以降の継続は、精度を優先する設計上、
+> 専用スピンスレッド上でインライン実行されうる。`await` の直後でブロッキング処理
+> （`lock`、ファイル / ネットワーク I/O、同期待ち、重いロギング）を行うと、
+> 同時に待機している他の待機項目の精度が損なわれる。重い処理は `Task.Run` などへ逃がすこと。
+> 詳細は [`document/specsheet.md`](document/specsheet.md) の 14.3 節を参照。
+
 ---
 
 ## API リファレンス
@@ -228,6 +234,12 @@ await PreciseDelay.WaitAsync(TimeSpan.FromMicroseconds(500), cancellationToken);
 // Call once at shutdown
 PreciseDelay.Shutdown();
 ```
+
+> **Note:** To keep precision, continuations after `await PreciseDelay.WaitAsync(...)`
+> may run inline on the dedicated spin thread. Blocking right after the `await`
+> (`lock`, file/network I/O, synchronous waits, heavy logging) degrades the accuracy of
+> every other wait pending at that moment. Move heavy work off with `Task.Run` or similar.
+> See section 14.3 of [`document/specsheet_en.md`](document/specsheet_en.md) for details.
 
 ---
 

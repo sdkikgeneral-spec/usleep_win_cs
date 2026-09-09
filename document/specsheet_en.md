@@ -585,6 +585,50 @@ instance is only reused once the caller has fully consumed the result.
 (the spin thread, single-threaded); no `Interlocked` operations are used. The
 `IsInitialized` flag guards against use-after-free.
 
+#### Which Thread Continuations Run On (Inline Execution)
+
+`PreciseWaitItem._vtsc` (`ManualResetValueTaskSourceCore<bool>`) **deliberately leaves
+`RunContinuationsAsynchronously` unset** (the default `false`). As a result,
+`SetResult()` / `SetException()` run the continuation — the caller's code after
+`await` — synchronously, right where they are called. The path is:
+
+```
+SpinCoreEngine.SpinLoop (pinned core, THREAD_PRIORITY_TIME_CRITICAL)
+  -> TimerWheel.Advance()
+    -> CompleteSlot()
+      -> PreciseWaitItem.Complete() / CompleteAsCancelled()
+        -> _vtsc.SetResult() / SetException()
+          -> continuation runs inline
+```
+
+`.AsTask()` passes `ValueTaskSourceOnCompletedFlags.None`, so both `_capturedContext`
+and `_executionContext` end up null. Inline execution is therefore not a theoretical
+possibility but a **guaranteed path**.
+
+**Why not set `RunContinuationsAsynchronously = true`?**
+It was tried and measured with `WaitAsync_500us_AverageErrorWithin50us` — 100 consecutive
+500 µs waits, averaging the absolute difference between the requested value and the elapsed
+time observed with `Stopwatch`. The average error **degraded from roughly 3 µs to roughly
+24 µs**, because continuations then travel through the `ThreadPool`. That undermines the
+±1–3 µs target stated in section 14.1, so the setting was rejected. Both figures come from a
+before/after comparison inside a single run with the setting toggled, so what carries meaning
+is the **roughly one-order-of-magnitude regression**, not the absolute values. With the setting
+reverted, the ordinary configuration measures in the 1–2 µs range — a different point in time
+under different conditions, so it should not be compared directly against the "roughly 3 µs"
+above; every one of these numbers moves with the host, the build configuration and concurrent load.
+
+**The trade-off pushes a constraint onto the caller:**
+
+> Continuations after `await PreciseDelay.WaitAsync(...)` may run on the spin thread.
+> Do not perform blocking work in the continuation (`lock`, file/network I/O,
+> synchronous waits, heavy logging). While it blocks, the spin thread is stalled and
+> the accuracy of **every other wait item pending at that moment** suffers.
+> If heavy work is required, move it off the thread yourself with `Task.Run` or similar.
+
+The same applies to the cancellation path: the body of
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` may also run on
+the spin thread.
+
 ### 14.4 TimerWheel Design
 
 #### Slot Calculation (Plain `long` Division)
@@ -767,14 +811,46 @@ returns FALSE, it likewise falls back to DelayFallbackAsync(delay, ct).
   simply "something that was already not guaranteed becoming coarser still"; it
   does not affect the spin path's accuracy contract.
 
-**Cancellation propagation:** whether cancelled via the step-0 pre-check, the
-`RegisterWaitForSingleObject` path (HR/non-HR timer), or the `DelayFallbackAsync`
-path, the caller-supplied `ct` now flows through directly into
-`OperationCanceledException.CancellationToken`. Previously `TrySetCanceled()` was
-called without a token, so a caller-side filter such as
-`catch (OperationCanceledException e) when (e.CancellationToken == ct)` would fail
-to match and let the exception pass through unhandled; it now matches correctly
-because cancellation carries `ct`.
+**Cancellation propagation:** regardless of which path a call takes — that is,
+regardless of the size of `delay` — `WaitAsync` surfaces the caller-supplied `ct`
+directly in `OperationCanceledException.CancellationToken`.
+
+- **>5 ms WaitableTimer path** — `ct` is carried by the step-0 pre-check, by the
+  `RegisterWaitForSingleObject` wait (HR and non-HR timer), and by the
+  `DelayFallbackAsync` path alike.
+- **≤5 ms spin path** — the wait item holds the token it received from
+  `PreciseWaitItemPool.Rent(ct)`, and the spin thread detects `CancellationRequested`
+  inside the wheel (`TimerWheel.CompleteSlot()`, or `TimerWheel.Enqueue()` when the
+  deadline has already passed) and calls `PreciseWaitItem.CompleteAsCancelled()`, which
+  does `SetException(new OperationCanceledException(ct))` using the token captured by
+  `Reset(ct)` — nothing but the next `Reset(ct)` ever overwrites that `CancellationToken`.
+
+The two paths used to disagree: the WaitableTimer path called `TrySetCanceled()`
+without a token, and the spin path constructed a bare `new OperationCanceledException()`.
+In either case a caller-side filter such as
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` failed to match
+and let the exception pass through unhandled. Both paths now cancel with `ct`, so the
+filter matches.
+
+Note that on the spin path cancellation is observed when the item's slot is processed —
+i.e. at the first processing point at or after the deadline — so cancelling never cuts
+the wait short. Completion happens after the requested `delay` (≤5 ms) has elapsed,
+never earlier; no upper bound on lateness is guaranteed (the same caveat as the accuracy
+note in section 14.5.1). What this section aligns is not the completion timing but the
+`CancellationToken` carried by the exception, which no longer depends on the path taken.
+
+The concrete exception type, however, is **not** aligned — **it still varies by path.** The >5 ms pre-check (`ct.ThrowIfCancellationRequested()`) and
+the ≤5 ms spin path (`PreciseWaitItem.CompleteAsCancelled()`) both raise a plain
+`OperationCanceledException`. A cancellation observed while the >5 ms path is already
+waiting goes through `TaskCompletionSource.TrySetCanceled(token)` and therefore surfaces
+as the derived `TaskCanceledException`. The `DelayFallbackAsync` path ends up with
+`TaskCanceledException` too, because `Task.Delay(TimeSpan, ct)` itself returns a `Task`
+cancelled with `ct`. `catch (OperationCanceledException)` and a
+`when (e.CancellationToken == ct)` filter hold on every path, so this makes no practical
+difference; but a caller that narrows to `catch (TaskCanceledException)`, or branches on
+`ex.GetType() == typeof(OperationCanceledException)`, will behave differently depending
+on which path the call took. **The API guarantees only that `ct` is carried, not the
+concrete type.**
 
 ### 14.6 Lifecycle and Safety
 
@@ -785,7 +861,20 @@ because cancellation carries `ct`.
 | `Initialize(cpuCore)` | `cpuCore >= IntPtr.Size * 8` | `ArgumentOutOfRangeException` |
 | `Initialize(cpuCore)` | Already initialized | `InvalidOperationException` |
 | `WaitAsync(...)` | Not initialized / after Shutdown | `InvalidOperationException` |
-| `WaitAsync(..., ct)` | `ct` already cancelled | `OperationCanceledException` |
+| `WaitAsync(..., ct)` | `ct` already cancelled (when `delay > 0`) | `OperationCanceledException` |
+| `WaitAsync(delay ≤ 0, ct)` | `delay ≤ 0` | none (completes normally even if `ct` is cancelled) |
+
+A `delay ≤ 0` returns an already-completed `ValueTask` before `ct` is ever inspected, so
+passing a cancelled token does not produce an exception. As long as `delay > 0`, this
+`OperationCanceledException` carries the caller-supplied `ct` in its `CancellationToken`
+property regardless of the path taken (i.e. regardless of the size of `delay`) — see
+"Cancellation propagation" in section 14.5.
+
+The cancellation exceptions in this table are what an `await` observes; they are not
+thrown synchronously out of `WaitAsync` (the >5 ms pre-check also lives inside an
+`async` method, so its exception rides on the returned `Task`). Only the
+`InvalidOperationException` for the uninitialized / post-Shutdown case is thrown
+synchronously.
 
 Inside `Initialize()`, a temporary variable is used for the `SpinCoreEngine` instance; it is assigned to `_engine` only after `Initialize()` succeeds. This prevents `IsInitialized` from being `true` after a failed initialization.
 
@@ -802,7 +891,23 @@ thread succeeds. If a live spin thread were allowed to touch a `TimerWheel` whos
 `ObjectDisposedException` and take the spin thread (and the process) down with it.
 If `Join` times out, the wheel is left for the GC instead of being disposed.
 
-### 14.7 Related Files
+### 14.7 Known Issues
+
+#### `PreciseWaitItem`'s `IPooledObjectPolicy` Implementation Is Never Invoked
+
+`PreciseWaitItem` implements `IPooledObjectPolicy<PreciseWaitItem>`, whose `Return(obj)`
+resets the held `CancellationToken` to `default`. `PreciseWaitItemPool`, however, builds
+its pool through the `ObjectPoolProvider.Create<T>()` overload that takes no policy
+argument, and that overload is specified to construct and use a
+`DefaultPooledObjectPolicy<T>` — so `T`'s own `IPooledObjectPolicy<T>` implementation is
+never consulted. As a result **this policy implementation is never invoked**.
+
+Nothing misbehaves because of it (the token simply is not cleared on return to the pool,
+and it is overwritten by the next `Reset(ct)`), but leaving an implementation that reads
+as "the token is cleared on return" is misleading. Whether to pass the policy explicitly
+or to drop the implementation is still undecided.
+
+### 14.8 Related Files
 
 | File | Content |
 | --- | --- |

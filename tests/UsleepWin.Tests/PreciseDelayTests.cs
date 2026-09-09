@@ -242,6 +242,95 @@ public class PreciseDelayWaitTests : IClassFixture<PreciseDelayFixture>
         Assert.Equal(cts.Token, ex.CancellationToken);
     }
 
+    /// <summary>
+    /// 既にキャンセル済みのトークンで &lt;=5ms（スピン経路）を待つと、
+    /// 渡したトークン付きでキャンセルされること。
+    /// PreciseWaitItem.CompleteAsCancelled() がトークン無しで
+    /// OperationCanceledException を投げていた不具合の回帰防止。
+    /// <para>
+    /// なお、事前にキャンセル済みでも即時には返らない。スピン経路のキャンセル検査は
+    /// TimerWheel の完了判定時にしか行われないため、例外が出るのはデッドライン
+    /// （ここでは約 3ms）到達以降。このテストが検証しているのはキャンセルの即時性ではなく、
+    /// 投げられる例外の中身（CancellationToken プロパティ）である。
+    /// </para>
+    /// <para>
+    /// 例外の型を exact 一致で確認するのは経路のピン留めのため。スピン経路は素の
+    /// <see cref="OperationCanceledException"/> を投げるが、&gt;5ms 経路へ流れると
+    /// <c>TaskCanceledException</c> になるので、閾値の取り違えを検出できる。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_SpinPath_PreCancelled_CarriesToken()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await PreciseDelay.WaitAsync(TimeSpan.FromMilliseconds(3), cts.Token)
+                              .AsTask()
+                              .WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.IsType<OperationCanceledException>(ex); // 派生型（>5ms 経路）を弾く
+        Assert.Equal(cts.Token, ex.CancellationToken);
+    }
+
+    /// <summary>
+    /// 締切が既に過去になっている待機要求（<c>TimerWheel.Enqueue()</c> の
+    /// 「過去 deadline」分岐）でも、キャンセル済みなら渡したトークン付きで
+    /// キャンセルされること。
+    /// <para>
+    /// 1 tick = 100ns なので、スピンスレッドが <c>_incoming</c> から取り出す時点で
+    /// 必ず現在スロット以下に落ち、<c>CompleteSlot()</c> ではなく <c>Enqueue()</c> 側の
+    /// 即時完了分岐を通る。この分岐の <c>CompleteAsCancelled()</c> を <c>Complete()</c> に
+    /// 書き換えると落ちる（他のテストは全て通ってしまう）ことが本テストの存在理由。
+    /// <c>TimeSpan.Zero</c> は <c>WaitAsync</c> 冒頭で短絡されるため使えない。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_SpinPath_PastDeadline_PreCancelled_CarriesToken()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await PreciseDelay.WaitAsync(TimeSpan.FromTicks(1), cts.Token)
+                              .AsTask()
+                              .WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.IsType<OperationCanceledException>(ex); // スピン経路であることのピン留め
+        Assert.Equal(cts.Token, ex.CancellationToken);
+    }
+
+    /// <summary>
+    /// スピン経路（≤5ms）の待機中にキャンセルしても、待機が早期に打ち切られないこと。
+    /// スピン経路のキャンセル検査はデッドライン到達時にしか行われない、という契約の固定。
+    /// <para>
+    /// 検証の主眼は経過時間の下限。例外の中身だけを見ると
+    /// <c>WaitAsync_SpinPath_PreCancelled_CarriesToken</c> と重複するため、
+    /// 「キャンセルで即座に返る」実装に変わったらここが落ちるようにしてある。
+    /// 上限は Windows がハードリアルタイム OS でないため断定できないので assert しない。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WaitAsync_SpinPath_CancelledDuringWait_DoesNotReturnEarly()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(2));
+
+        var sw = Stopwatch.StartNew();
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await PreciseDelay.WaitAsync(TimeSpan.FromMilliseconds(5), cts.Token)
+                              .AsTask()
+                              .WaitAsync(TimeSpan.FromSeconds(5)));
+        sw.Stop();
+
+        long elapsedUs = sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+
+        Assert.Equal(cts.Token, ex.CancellationToken);
+        // 下限のみ。計測系の誤差ぶんを見て 4500µs で判定する
+        Assert.True(elapsedUs >= 4500,
+            $"5000µs の待機がキャンセルで {elapsedUs}µs に短縮された");
+    }
+
     [Fact]
     public async Task WaitAsync_CancelledDuringWait_ThrowsOperationCanceledException()
     {
@@ -360,6 +449,7 @@ public class PreciseDelayWaitTests : IClassFixture<PreciseDelayFixture>
 /// PreciseDelay 越しではスピンスレッドのプリエンプトを再現できず、
 /// 過去 deadline の大量投入やホイール範囲外の経路を踏めないため。
 /// </summary>
+[Collection("PreciseDelay")]
 public class TimerWheelBoundaryTests
 {
     private const long RequiredSpanUs = PreciseDelay.SpinPathMaxMilliseconds * 1000L;

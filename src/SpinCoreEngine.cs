@@ -71,8 +71,10 @@ internal sealed class SpinCoreEngine : IDisposable
         var  item     = PreciseWaitItemPool.Rent(ct);
         long deadline = Stopwatch.GetTimestamp()
                         + (long)(delay.TotalSeconds * Stopwatch.Frequency);
+        // スピンスレッドへ公開する前に版（_vtsc.Version）を確定させる。
+        var vt = item.AsValueTask();
         _incoming.Enqueue((item, deadline));
-        return item.AsValueTask();
+        return vt;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

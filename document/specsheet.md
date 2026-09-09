@@ -570,6 +570,49 @@ public void GetResult(short token)
 `Complete()` / `CompleteAsCancelled()` は `SpinLoop`（スピンスレッド単独）からのみ呼ぶ設計で、
 `Interlocked` は使用しない。`IsInitialized` フラグで use-after-free を防止する。
 
+#### 継続の実行スレッド（インライン実行）
+
+`PreciseWaitItem._vtsc`（`ManualResetValueTaskSourceCore<bool>`）は
+`RunContinuationsAsynchronously` を**意図的に設定していない**（既定の `false` のまま）。
+そのため `SetResult()` / `SetException()` は、継続（＝呼び出し側の `await` 以降のコード）を
+その場で同期的に実行する。経路は次のとおり。
+
+```
+SpinCoreEngine.SpinLoop（コア固定・THREAD_PRIORITY_TIME_CRITICAL）
+  → TimerWheel.Advance()
+    → CompleteSlot()
+      → PreciseWaitItem.Complete() / CompleteAsCancelled()
+        → _vtsc.SetResult() / SetException()
+          → 継続をインライン実行
+```
+
+`.AsTask()` は `ValueTaskSourceOnCompletedFlags.None` を渡すため `_capturedContext` /
+`_executionContext` がいずれも null になる。つまりインライン実行は理論上の可能性ではなく
+**確定経路**である。
+
+**なぜ `RunContinuationsAsynchronously = true` にしないのか。**
+一度この設定を入れて実測したところ、`WaitAsync_500us_AverageErrorWithin50us`
+（500 µs の待機を 100 回繰り返し、`Stopwatch` による実測経過と要求値との差の絶対値を平均する）の
+平均誤差が**約 3 µs から約 24 µs へ悪化**した（継続が `ThreadPool` 経由になるため）。14.1 節に掲げる
+±1〜3 µs の目標精度を損なうため、採用しないという判断をしている。
+この 2 つの数値は同一実行内で設定を入れる前と後を比べた対照実験の結果であり、
+意味を持つのは絶対値ではなく**およそ 1 桁の悪化幅**のほうである。
+設定を差し戻した現在の通常構成での実測は 1〜2 µs 台だが、これは計測時点も条件も異なるため
+上記の「約 3 µs」と直接比較すべきではない。いずれの値も実行環境・ビルド構成・
+同時負荷によって変動する。
+
+**その代償として、呼び出し側に次の制約が生じる。**
+
+> `await PreciseDelay.WaitAsync(...)` 以降の継続は、スピンスレッド上で実行されうる。
+> 継続でブロッキング処理（`lock`、ファイル / ネットワーク I/O、同期待ち、重いロギング）を
+> 行ってはならない。その間スピンスレッドが停止し、同時に待機している
+> **他のすべての待機項目**の精度が損なわれる。
+> 重い処理が必要な場合は `Task.Run` などで呼び出し側が明示的にスレッドを移すこと。
+
+キャンセル経路も同様で、
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` の catch 本体も
+スピンスレッド上で実行されうる。
+
 ### 14.4 TimerWheel の設計
 
 #### スロット計算（素直な long 除算）
@@ -732,13 +775,40 @@ SetWaitableTimer(handle, ...) が FALSE を返した場合も
   による精度低下は「元々保証していなかったものがさらに粗くなる」だけであり、
   スピンパスの精度契約には影響しない。
 
-**キャンセルの伝播:** `ct` によるキャンセルは、0. の事前チェック、
-`RegisterWaitForSingleObject` 経由の待機（HR/非 HR タイマー経路）、
-`DelayFallbackAsync` 経路のいずれでも、呼び出し側が渡した `ct` がそのまま
-`OperationCanceledException.CancellationToken` に載る。従来は
-`TrySetCanceled()` をトークン無しで呼んでいたため、呼び出し側の
-`catch (OperationCanceledException e) when (e.CancellationToken == ct)` のような
-フィルタが一致せず素通りしていたが、現在は `ct` 付きでキャンセルするため一致する。
+**キャンセルの伝播:** `WaitAsync` は経路（＝`delay` の大小）によらず、呼び出し側が渡した
+`ct` をそのまま `OperationCanceledException.CancellationToken` に載せる。
+
+- **>5 ms の WaitableTimer 経路** — 0. の事前チェック、`RegisterWaitForSingleObject` 経由の
+  待機（HR/非 HR タイマー経路）、`DelayFallbackAsync` 経路のいずれでも `ct` が載る。
+- **≤5 ms のスピン経路** — 待機アイテムは `PreciseWaitItemPool.Rent(ct)` でトークンを保持し、
+  スピンスレッドが `TimerWheel` 側（`CompleteSlot()`、および締切を既に過ぎている場合は
+  `Enqueue()`）で `CancellationRequested` を検出して `PreciseWaitItem.CompleteAsCancelled()` を
+  呼ぶ。そこで `Reset(ct)` で保持しておいた `ct` を載せた `OperationCanceledException` を
+  `SetException()` する（この `CancellationToken` は次の `Reset(ct)` 以外で書き換えられない）。
+
+従来は WaitableTimer 経路が `TrySetCanceled()` をトークン無しで呼び、スピン経路が
+`new OperationCanceledException()` をトークン無しで生成していた。どちらも呼び出し側の
+`catch (OperationCanceledException e) when (e.CancellationToken == ct)` のようなフィルタが
+一致せず素通りしていたが、現在は両経路とも `ct` 付きでキャンセルするため一致する。
+
+なおスピン経路でキャンセルが観測されるのは、アイテムのスロットが処理される時点、すなわち
+**締切以降の最初の処理時点**であり、キャンセルによって待機が早期に打ち切られることはない。
+完了は要求した `delay`（≤5 ms）ぶん経過してからで、それより早くはならない。
+遅れ側の上限は保証しない（14.5.1 節の精度に関する但し書きと同じ）。
+本節が揃えているのは完了のタイミングではなく、**例外に載る `CancellationToken`** が
+経路によって割れないことである。
+
+トークンは揃うが、**例外の具象型は経路によって異なる。** >5 ms 経路の事前チェック
+（`ct.ThrowIfCancellationRequested()`）と ≤5 ms のスピン経路（`PreciseWaitItem.CompleteAsCancelled()`）は
+`OperationCanceledException` そのものを投げる。>5 ms 経路で待機中にキャンセルされた場合は
+`TaskCompletionSource.TrySetCanceled(token)` を経由するため、その派生型である
+`TaskCanceledException` になる。`DelayFallbackAsync` 経路も、`Task.Delay(TimeSpan, ct)` 自身が
+`ct` 付きでキャンセル済みの `Task` を返すため同じく `TaskCanceledException` になる。
+`catch (OperationCanceledException)` および `when (e.CancellationToken == ct)` は
+いずれの経路でも成立するので実用上の差は無いが、
+`catch (TaskCanceledException)` で絞る、あるいは `ex.GetType() == typeof(OperationCanceledException)` で
+分岐する呼び出し側は経路によって挙動が変わる。**本 API が保証するのは `ct` が載ることだけで、
+具象型は保証しない。**
 
 ### 14.6 ライフサイクルと安全性
 
@@ -749,7 +819,18 @@ SetWaitableTimer(handle, ...) が FALSE を返した場合も
 | `Initialize(cpuCore)` | `cpuCore >= IntPtr.Size * 8` | `ArgumentOutOfRangeException` |
 | `Initialize(cpuCore)` | 既に初期化済み | `InvalidOperationException` |
 | `WaitAsync(...)` | 未初期化 / Shutdown 後 | `InvalidOperationException` |
-| `WaitAsync(..., ct)` | `ct` が既にキャンセル済み | `OperationCanceledException` |
+| `WaitAsync(..., ct)` | `ct` が既にキャンセル済み（`delay > 0` の場合） | `OperationCanceledException` |
+| `WaitAsync(TimeSpan.Zero 以下, ct)` | `delay ≤ 0` | 例外なし（`ct` がキャンセル済みでも正常完了） |
+
+`delay ≤ 0` は `ct` を見る前に完了済みの `ValueTask` を返すため、キャンセル済みトークンを
+渡しても例外にならない。`delay > 0` であれば経路（＝`delay` の大小）によらず、この
+`OperationCanceledException` は呼び出し側の `ct` を `CancellationToken` プロパティに載せる
+（14.5 節「キャンセルの伝播」参照）。
+
+なおこの表のキャンセル系の例外は `await` した際に観測されるもので、`WaitAsync` から
+同期的に投げられるわけではない（>5 ms 経路の事前キャンセルチェックも `async` メソッドの
+内側にあるため、例外は返された `Task` に載る）。未初期化 / Shutdown 後の
+`InvalidOperationException` だけは `WaitAsync` から同期的に投げられる。
 
 `Initialize()` 内では `SpinCoreEngine` の一時変数に代入してから `Initialize()` を呼び、成功した場合のみ `_engine` フィールドに代入する（例外時に `IsInitialized` が `true` になるバグを防止）。
 
@@ -765,7 +846,21 @@ SetWaitableTimer(handle, ...) が FALSE を返した場合も
 次の `Enqueue()` が `ObjectDisposedException` を投げてスピンスレッドごとプロセスが落ちるため。
 `Join` がタイムアウトした場合はホイールを解放せず GC に委ねる。
 
-### 14.7 関連ファイル
+### 14.7 既知の課題
+
+#### `PreciseWaitItem` の `IPooledObjectPolicy` 実装が呼ばれない
+
+`PreciseWaitItem` は `IPooledObjectPolicy<PreciseWaitItem>` を実装しており、その `Return(obj)` は
+保持している `CancellationToken` を `default` に戻す。しかし `PreciseWaitItemPool` は
+ポリシー引数を取らないオーバーロード `ObjectPoolProvider.Create<T>()` でプールを構築しており、
+このオーバーロードは `DefaultPooledObjectPolicy<T>` を生成して使う仕様のため、`T` 自身の
+`IPooledObjectPolicy<T>` 実装は参照されない。結果として**このポリシー実装は一度も呼ばれない**。
+
+動作上の不具合は生じていない（プール返却時にトークンがクリアされないだけで、トークンは
+次の `Reset(ct)` で上書きされる）が、「返却時にクリアされる」と読める実装が残っている点が
+誤解を招く。ポリシーを明示的に渡すか、実装を削除するかは未決。
+
+### 14.8 関連ファイル
 
 | ファイル | 内容 |
 | --- | --- |
